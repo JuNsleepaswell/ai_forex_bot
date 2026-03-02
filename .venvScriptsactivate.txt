@@ -1,0 +1,262 @@
+ .\venv\Scripts\activate
+
+python src/01_mt5_data_ingestion.py --ticker EURUSD
+python src/01_mt5_data_ingestion.py --ticker GBPUSD
+python src/01_mt5_data_ingestion.py --ticker AUDUSD
+python src/01_mt5_data_ingestion.py --ticker NZDUSD
+python src/01_mt5_data_ingestion.py --ticker USDCAD
+python src/01_mt5_data_ingestion.py --ticker USDCHF
+python src/01_mt5_data_ingestion.py --ticker USDJPY
+
+python src/01_mt5_multiframe_ingestion.py --ticker EURUSD
+python src/01_mt5_multiframe_ingestion.py --ticker GBPUSD
+python src/01_mt5_multiframe_ingestion.py --ticker AUDUSD
+python src/01_mt5_multiframe_ingestion.py --ticker NZDUSD
+python src/01_mt5_multiframe_ingestion.py --ticker USDCAD
+python src/01_mt5_multiframe_ingestion.py --ticker USDCHF
+python src/01_mt5_multiframe_ingestion.py --ticker USDJPY
+python src/01_mt5_multiframe_ingestion.py --ticker XAUUSD
+
+
+python src/02_multiframe_feature_engineering.py --ticker EURUSD
+python src/02_multiframe_feature_engineering.py --ticker GBPUSD
+python src/02_multiframe_feature_engineering.py --ticker AUDUSD
+python src/02_multiframe_feature_engineering.py --ticker NZDUSD
+python src/02_multiframe_feature_engineering.py --ticker USDCAD
+python src/02_multiframe_feature_engineering.py --ticker XAUUSD
+python src/02_multiframe_feature_engineering.py --ticker USDCHF
+python src/02_multiframe_feature_engineering.py --ticker USDJPY
+
+python src/03_multiframe_signal_training.py --ticker EURUSD
+python src/03_multiframe_signal_training.py --ticker GBPUSD
+python src/03_multiframe_signal_training.py --ticker AUDUSD
+python src/03_multiframe_signal_training.py --ticker NZDUSD
+python src/03_multiframe_signal_training.py --ticker USDCAD
+python src/03_multiframe_signal_training.py --ticker USDCHF
+python src/03_multiframe_signal_training.py --ticker USDJPY
+
+python src/04_multiframe_risk_training.py --ticker EURUSD
+python src/04_multiframe_risk_training.py --ticker GBPUSD
+python src/04_multiframe_risk_training.py --ticker AUDUSD
+python src/04_multiframe_risk_training.py --ticker NZDUSD
+python src/04_multiframe_risk_training.py --ticker USDCAD
+python src/04_multiframe_risk_training.py --ticker USDCHF
+python src/04_multiframe_risk_training.py --ticker USDJPY
+
+python src/11_wfo_processor.py --ticker AUDUSD
+python src/11_wfo_processor.py --ticker EURUSD
+python src/11_wfo_processor.py --ticker GBPUSD
+python src/11_wfo_processor.py --ticker NZDUSD
+python src/11_wfo_processor.py --ticker USDCAD
+python src/11_wfo_processor.py --ticker XAUUSD
+
+
+D:
+cd ai_forex_bot
+.\venv\Scripts\activate
+python src/10_live_trader.py
+
+
+D:
+cd ai_forex_bot
+.\venv\Scripts\activate
+python src/10_live_trader.py --mt5_path "C:\Program Files\MetaTrader 5 Terminal\terminal64.exe"
+
+python src/10_live_trader_us500.py --mt5_path "C:\Program Files\MetaTrader 5 Terminal\terminal64.exe"
+
+D:
+cd ai_forex_bot
+.\venv\Scripts\activate
+python src/10_live_trader_gold.py --mt5_path "C:\Program Files\MT5_Account_2\terminal64.exe"
+
+
+
+python src/02_feature_engineering.py --ticker EURUSD
+python src/02_feature_engineering.py --ticker GBPUSD
+python src/02_feature_engineering.py --ticker AUDUSD
+python src/02_feature_engineering.py --ticker NZDUSD
+python src/02_feature_engineering.py --ticker USDCAD
+python src/02_feature_engineering.py --ticker USDCHF
+python src/02_feature_engineering.py --ticker USDJPY
+
+
+
+python src/03_xgboost_feature_selection.py --ticker EURUSD
+python src/03_xgboost_feature_selection.py --ticker GBPUSD
+python src/03_xgboost_feature_selection.py --ticker AUDUSD
+python src/03_xgboost_feature_selection.py --ticker NZDUSD
+python src/03_xgboost_feature_selection.py --ticker USDCAD
+python src/03_xgboost_feature_selection.py --ticker USDCHF
+python src/03_xgboost_feature_selection.py --ticker USDJPY
+
+
+python src/04_lstm_data_preparation.py --ticker EURUSD
+python src/04_lstm_data_preparation.py --ticker GBPUSD
+python src/04_lstm_data_preparation.py --ticker AUDUSD
+python src/04_lstm_data_preparation.py --ticker NZDUSD
+python src/04_lstm_data_preparation.py --ticker USDCAD
+python src/04_lstm_data_preparation.py --ticker USDCHF
+python src/04_lstm_data_preparation.py --ticker USDJPY
+
+
+python src/05_lstm_model_training.py --ticker EURUSD
+python src/05_lstm_model_training.py --ticker GBPUSD
+python src/05_lstm_model_training.py --ticker AUDUSD
+python src/05_lstm_model_training.py --ticker NZDUSD
+python src/05_lstm_model_training.py --ticker USDCAD
+python src/05_lstm_model_training.py --ticker USDCHF
+python src/05_lstm_model_training.py --ticker USDJPY
+
+
+
+No problem at all. Here is the step-by-step guide to recreating your environment from scratch on Windows.
+
+This includes the specific fixes we applied for TensorFlow (CPU) and the manual installation of pandas_ta.
+
+Step 1: Open PowerShell and Go to Project
+
+Open PowerShell.
+
+Navigate to your project folder:
+
+code
+Powershell
+download
+content_copy
+expand_less
+D:
+cd ai_forex_bot
+Step 2: Create and Activate the Virtual Environment
+
+Create the environment:
+
+code
+Powershell
+download
+content_copy
+expand_less
+python -m venv venv
+
+Activate it:
+
+code
+Powershell
+download
+content_copy
+expand_less
+.\venv\Scripts\activate
+
+(Your terminal prompt should now show (venv) at the start).
+
+Step 3: Install the Main Libraries
+
+Run this single command to install the stable, CPU-optimized versions of the libraries:
+
+code
+Powershell
+download
+content_copy
+expand_less
+pip install tensorflow-intel pandas scikit-learn xgboost MetaTrader5 streamlit joblib matplotlib
+Step 4: Manually Install pandas_ta
+
+Since the standard installation fails on Python 3.11, we must install it from the source folder you downloaded previously.
+
+Navigate to your Downloads folder (where you unzipped pandas_ta):
+
+code
+Powershell
+download
+content_copy
+expand_less
+cd C:\Users\siasu\Downloads\pandas_ta-0.3.14b\pandas_ta-0.3.14b
+
+(If you deleted this folder, let me know, and I will give you the link to download it again).
+
+Run the installation:
+
+code
+Powershell
+download
+content_copy
+expand_less
+python setup.py install
+
+Go back to your project folder:
+
+code
+Powershell
+download
+content_copy
+expand_less
+cd D:\ai_forex_bot
+Step 5: Apply the NaN Fix (Crucial)
+
+The version of pandas_ta we just installed has a small bug with the new numpy library. You must fix one line of code manually.
+
+Navigate to this file in your File Explorer:
+D:\ai_forex_bot\venv\Lib\site-packages\pandas_ta\momentum\
+(Note: You might need to look inside an .egg folder if it exists there).
+
+Open the file named: squeeze_pro.py (Right-click -> Open with Notepad).
+
+Find Line 2:
+
+code
+Python
+download
+content_copy
+expand_less
+from numpy import NaN as npNaN
+
+Change it to:
+
+code
+Python
+download
+content_copy
+expand_less
+from numpy import nan as npNaN
+
+Save and Close.
+
+Step 6: Verify
+
+Run your feature engineering script to make sure everything is connected correctly:
+
+code
+Powershell
+download
+content_copy
+expand_less
+python src/02_feature_engineering.py --ticker EURUSD
+
+If that runs without errors, your environment is perfectly set up again!
+
+
+--- Scan: 2026-02-11 20:40:41 ---
+  Max active trades reached (1). Waiting.
+  GBPUSD: Position open. P&L: -30.42
+Sleeping for 60 seconds...
+
+--- Scan: 2026-02-11 20:41:41 ---
+  Max active trades reached (1). Waiting.
+  GBPUSD: Position open. P&L: -157.17
+Sleeping for 60 seconds...
+
+--- Scan: 2026-02-11 20:42:42 ---
+  AUDUSD: Chop (ADX 23.8). Skipping.
+  EURUSD: Prob=0.46 | Vol=0.00055
+  GBPUSD: Prob=0.37 | Vol=0.00089
+  NZDUSD: Prob=0.49 | Vol=0.00042
+  USDCAD: Prob=0.60 | Vol=0.00052
+Sleeping for 60 seconds...
+
+--- Scan: 2026-02-11 20:43:42 ---
+  AUDUSD: Chop (ADX 23.9). Skipping.
+  EURUSD: Prob=0.47 | Vol=0.00055
+  GBPUSD: Prob=0.39 | Vol=0.00089
+  NZDUSD: Prob=0.49 | Vol=0.00042
+  USDCAD: Prob=0.60 | Vol=0.00052
+Sleeping for 60 seconds...
+

@@ -1,0 +1,15 @@
+# Data and Models
+data/*.csv
+models/*.zip
+*.log
+hyper_tuning
+M15 v1 output
+
+# Python
+__pycache__/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
