@@ -10,7 +10,8 @@ TICKER = "AUDCAD"
 OBSERVATION_FEATURES = [
     'H1_Norm_Ret_1', 'H1_Norm_Ret_4', 'H1_Norm_Ret_12', 'H1_Norm_Ret_24',
     'Vol_Regime', 'FracDiff_Close', 'H1_Autocorr', 'H1_ZScore_50',
-    'H1_ER', 'ATR_Ratio', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos'
+    'H1_ER', 'ATR_Ratio', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
+    'Price_Stretch', 'MA_Speed', 'RSI_Velocity', 'ATR_Relative'  # <--- ADDED THESE 4
 ]
 
 # Re-defining the Env Class inside or importing it is necessary for the model to load

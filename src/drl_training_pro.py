@@ -93,18 +93,22 @@ class ForexTradingEnvPro(gym.Env):
         self.returns_history.append(step_pnl)
 
         # 4. Volatility Normalized Reward
+        vol = 1.0
         if len(self.returns_history) >= 20:
             vol = np.std(self.returns_history) + 1e-8
-            reward = step_pnl / vol
-        else:
-            reward = step_pnl
 
-        # In your step function:
+        current_atr_rel = self.df.loc[self.current_step, 'ATR_Relative']
+
         if mapped_action == 0:
-            reward = 0.01  # Small positive reward for staying safe when signal is weak
+            reward = 0.0  # Safe harbor. No free money, but no losses.
         else:
-            # Scale the reward down if the agent is just "guessing"
-            reward = step_pnl / (vol + 1e-8)
+            # THE SNIPER RULE: If volatility is low, do not trade.
+            if current_atr_rel < 0.8:
+                # Massive penalty for trading in the chop
+                reward = step_pnl - 0.002
+            else:
+                # Normal reward scaling for valid volatile regimes
+                reward = step_pnl / (vol + 1e-8)
 
         self.current_position = mapped_action
         self.current_step += 1
@@ -139,14 +143,15 @@ def main():
         "MlpLstmPolicy",
         env,
         learning_rate=1e-4,
-        n_steps=4096,
-        batch_size=256,
-        ent_coef=0.10,  # High exploration to find patterns in noise
+        n_steps=8192,  # <--- INCREASED: Lets the model see longer sequences before updating
+        batch_size=512,  # <--- INCREASED: Looks at more examples at once
+        ent_coef=0.10,
         gae_lambda=0.95,
         clip_range=0.2,
         policy_kwargs=policy_kwargs,
         verbose=1,
-        device="cuda"
+        device="cuda",
+        patience=10
     )
 
     # Checkpoint every 500k steps

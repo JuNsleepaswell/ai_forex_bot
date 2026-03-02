@@ -1,6 +1,11 @@
 # Data and Models
 data/*.csv
-models/*.zip
+models/
+*.joblib
+*.npz
+*.csv
+*.zip
+*.log
 *.log
 hyper_tuning
 M15 v1 output
@@ -13,3 +18,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE and Python
+.idea/
+__pycache__/
+venv/
+.env
