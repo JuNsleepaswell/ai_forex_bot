@@ -28,7 +28,7 @@ def calculate_max_drawdown(equity_curve):
 def main():
     print(f"--- Pro Backtester: Evaluating {TICKER} ---")
 
-    model_path = f"models/pro_lstm_{TICKER}_final.zip"
+    model_path = "./models/best_model/best_model.zip"
     if not os.path.exists(model_path):
         print(f"Error: {model_path} not found. Train the model first!")
         return

@@ -131,7 +131,7 @@ def get_live_features(trade_symbol):
         h1_er = ta.er(df_h1['close'], length=10).iloc[-1]
 
         dxy_ret, spy_ret, us10y_ret = get_live_macro()
-        server_time = datetime.fromtimestamp(rates_h1[-1]['time'])
+        server_time = datetime.utcfromtimestamp(rates_h1[-1]['time'])
 
         features = {
             'D1_Norm_Ret': d1_norm_ret,
@@ -185,11 +185,12 @@ def close_position(pos, comment="Hard Time Exit"):
 
 def strategy_tick():
     tick = mt5.symbol_info_tick(get_broker_symbol(TICKERS[0]))
-    if tick is None:
-        print("  Waiting for MT5 connection/ticks...")
+    # Block empty ticks from the 1970 epoch
+    if tick is None or tick.time == 0:
+        print("  Waiting for valid MT5 ticks (Broker warming up)...")
         return
 
-    server_time = datetime.fromtimestamp(tick.time)
+    server_time = datetime.utcfromtimestamp(tick.time)
     hour = server_time.hour
     minute = server_time.minute
 
@@ -302,11 +303,23 @@ def strategy_tick():
 
 
 if __name__ == "__main__":
+
+    print("\nForcing MT5 to subscribe to live market data...")
+    for ticker in TICKERS:
+        trade_symbol = get_broker_symbol(ticker)
+        success = mt5.symbol_select(trade_symbol, True)
+        if not success:
+            print(f"  [ERROR] MT5 cannot find '{trade_symbol}'.")
+        else:
+            print(f"  [OK] '{trade_symbol}' data stream activated.")
+
+    print("  Waiting 3 seconds for broker data feeds to populate...")
+    time.sleep(3)  # <--- ADD THIS LINE
+
     while True:
         try:
             strategy_tick()
         except Exception as e:
             print(f"Critical Loop Error: {e}")
-        # Run every 5 minutes to ensure we don't miss the strict time exits,
-        # but don't spam the server every second.
+        # Run every 5 minutes to ensure we don't miss the strict time exits
         time.sleep(60 * 5)

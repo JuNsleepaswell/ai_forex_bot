@@ -4,7 +4,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnNoModelImprovement, CallbackList
 from collections import deque
 import os
 
@@ -116,6 +116,7 @@ class ForexTradingEnvPro(gym.Env):
         terminated = self.current_step >= self.max_steps
         return self._get_observation(), reward, terminated, False, {"pnl": step_pnl, "pos": self.current_position}
 
+
 def main():
     print(f"--- Deep Reinforcement Learning: PRO Agent ({TICKER}) ---")
 
@@ -127,11 +128,16 @@ def main():
     df = pd.read_csv(data_path)
     df.dropna(subset=OBSERVATION_FEATURES, inplace=True)
 
-    train_df = df.iloc[:int(len(df) * 0.8)].copy()
-    env = DummyVecEnv([lambda: ForexTradingEnvPro(train_df)])
+    # 1. Split Data: 80% Train, 10% Validation
+    train_split = int(len(df) * 0.8)
+    val_split = int(len(df) * 0.9)
 
-    # Split Policy/Value Network architecture
-    # Pi (Policy) decides the action, Qf (Value) estimates the reward
+    train_df = df.iloc[:train_split].copy()
+    val_df = df.iloc[train_split:val_split].copy()
+
+    env = DummyVecEnv([lambda: ForexTradingEnvPro(train_df)])
+    eval_env = DummyVecEnv([lambda: ForexTradingEnvPro(val_df)])  # Validation Environment
+
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], qf=[256, 256]),
         lstm_hidden_size=256,
@@ -143,22 +149,41 @@ def main():
         "MlpLstmPolicy",
         env,
         learning_rate=1e-4,
-        n_steps=8192,  # <--- INCREASED: Lets the model see longer sequences before updating
-        batch_size=512,  # <--- INCREASED: Looks at more examples at once
+        n_steps=8192,
+        batch_size=512,
         ent_coef=0.10,
         gae_lambda=0.95,
         clip_range=0.2,
         policy_kwargs=policy_kwargs,
         verbose=1,
         device="cuda",
-        patience=10
+        tensorboard_log="./tensorboard_logs/"  # Added this back so you can watch the graphs!
     )
 
-    # Checkpoint every 500k steps
+    # 2. Setup Patience (Early Stopping)
+    # INCREASE PATIENCE: Give it 40 evaluations (400,000 steps) to beat its high score
+    stop_train_callback = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=40,
+        min_evals=10,
+        verbose=1
+    )
+
+    # Evaluates the model every 10,000 steps
+    eval_callback = EvalCallback(
+        eval_env,
+        eval_freq=10000,
+        callback_after_eval=stop_train_callback,
+        best_model_save_path='./models/best_model/',
+        verbose=1
+    )
+
+    # 3. Combine Callbacks
     checkpoint = CheckpointCallback(save_freq=500000, save_path='./models/', name_prefix='pro_agent')
+    callback_list = CallbackList([checkpoint, eval_callback])
 
     print("Beginning Training (2 Million Timesteps)...")
-    model.learn(total_timesteps=2000000, callback=checkpoint)
+    # Pass the combined callback list here
+    model.learn(total_timesteps=2000000, callback=callback_list)
 
     model.save(f"models/pro_lstm_{TICKER}_final")
     print(f"Model saved as models/pro_lstm_{TICKER}_final.zip")
