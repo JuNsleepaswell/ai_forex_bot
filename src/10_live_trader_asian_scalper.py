@@ -174,7 +174,7 @@ def close_position(pos, comment="Hard Time Exit"):
         "magic": MAGIC_NUMBER,
         "comment": comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": mt5.ORDER_FILLING_FOK,
     }
     res = mt5.order_send(request)
     if res and res.retcode == mt5.TRADE_RETCODE_DONE:
@@ -292,7 +292,7 @@ def strategy_tick():
             "magic": MAGIC_NUMBER,
             "comment": "V9_Asian_Scalp",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
         }
 
         res = mt5.order_send(request)

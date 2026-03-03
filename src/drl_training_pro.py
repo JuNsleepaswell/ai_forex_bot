@@ -93,6 +93,7 @@ class ForexTradingEnvPro(gym.Env):
         self.returns_history.append(step_pnl)
 
         # 4. Volatility Normalized Reward
+        # 4. Volatility Normalized Reward
         vol = 1.0
         if len(self.returns_history) >= 20:
             vol = np.std(self.returns_history) + 1e-8
@@ -100,15 +101,22 @@ class ForexTradingEnvPro(gym.Env):
         current_atr_rel = self.df.loc[self.current_step, 'ATR_Relative']
 
         if mapped_action == 0:
-            reward = 0.0  # Safe harbor.
+            # THE FOMO RULE: If the market is highly volatile, staying flat hurts slightly
+            if current_atr_rel >= 0.8:
+                reward = -0.001
+            else:
+                reward = 0.0  # Perfect patience in a dead market
         else:
             if current_atr_rel < 0.8:
-                # Massive penalty for trading in the chop (Keep the Stick)
+                # The Boredom Penalty: Still hurts to trade in chop
                 reward = step_pnl - 0.002
             else:
-                # THE BIG CARROT: Multiply the reward by 10 so winning trends
-                # heavily outweigh the fear of spread costs.
-                reward = (step_pnl * 10.0) / (vol + 1e-8)
+                # ASYMMETRIC CARROT: Boost the wins, but keep the losses normal
+                norm_pnl = step_pnl / vol
+                if step_pnl > 0:
+                    reward = norm_pnl * 5.0  # 5x multiplier ONLY on winning trades
+                else:
+                    reward = norm_pnl  # Normal penalty for losing trades
 
         self.current_position = mapped_action
         self.current_step += 1
