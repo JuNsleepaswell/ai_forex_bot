@@ -100,15 +100,15 @@ class ForexTradingEnvPro(gym.Env):
         current_atr_rel = self.df.loc[self.current_step, 'ATR_Relative']
 
         if mapped_action == 0:
-            reward = 0.0  # Safe harbor. No free money, but no losses.
+            reward = 0.0  # Safe harbor.
         else:
-            # THE SNIPER RULE: If volatility is low, do not trade.
             if current_atr_rel < 0.8:
-                # Massive penalty for trading in the chop
+                # Massive penalty for trading in the chop (Keep the Stick)
                 reward = step_pnl - 0.002
             else:
-                # Normal reward scaling for valid volatile regimes
-                reward = step_pnl / (vol + 1e-8)
+                # THE BIG CARROT: Multiply the reward by 10 so winning trends
+                # heavily outweigh the fear of spread costs.
+                reward = (step_pnl * 10.0) / (vol + 1e-8)
 
         self.current_position = mapped_action
         self.current_step += 1
