@@ -5,11 +5,11 @@ from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnNoModelImprovement, CallbackList
+import argparse # <--- Add this at the very top of your file with the other imports
 from collections import deque
 import os
 
 # --- CONFIGURATION ---
-TICKER = "AUDCAD"
 SPREAD_COST = 0.00018  # Typical spread + slippage buffer
 CHURN_PENALTY = 0.00040
 WINDOW_SIZE = 72
@@ -125,18 +125,18 @@ class ForexTradingEnvPro(gym.Env):
         return self._get_observation(), reward, terminated, False, {"pnl": step_pnl, "pos": self.current_position}
 
 
-def main():
-    print(f"--- Deep Reinforcement Learning: PRO Agent ({TICKER}) ---")
+def main(ticker):
+    print(f"--- Deep Reinforcement Learning: PRO Agent ({ticker}) ---")
 
-    data_path = f'data/{TICKER}_SUPER_dataset.csv'
+    data_path = f'data/{ticker}_SUPER_dataset.csv'
     if not os.path.exists(data_path):
-        print(f"Error: {data_path} not found. Run Step 2 first!")
+        print(f"Error: {data_path} not found. Skipping {ticker}.")
         return
 
     df = pd.read_csv(data_path)
     df.dropna(subset=OBSERVATION_FEATURES, inplace=True)
 
-    # 1. Split Data: 80% Train, 10% Validation
+    # Split Data: 80% Train, 10% Validation
     train_split = int(len(df) * 0.8)
     val_split = int(len(df) * 0.9)
 
@@ -144,7 +144,7 @@ def main():
     val_df = df.iloc[train_split:val_split].copy()
 
     env = DummyVecEnv([lambda: ForexTradingEnvPro(train_df)])
-    eval_env = DummyVecEnv([lambda: ForexTradingEnvPro(val_df)])  # Validation Environment
+    eval_env = DummyVecEnv([lambda: ForexTradingEnvPro(val_df)])
 
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], qf=[256, 256]),
@@ -165,37 +165,35 @@ def main():
         policy_kwargs=policy_kwargs,
         verbose=1,
         device="cuda",
-        tensorboard_log="./tensorboard_logs/"  # Added this back so you can watch the graphs!
+        tensorboard_log=f"./tensorboard_logs/{ticker}/"  # SEPARATE GRAPHS PER PAIR
     )
 
-    # 2. Setup Patience (Early Stopping)
-    # INCREASE PATIENCE: Give it 40 evaluations (400,000 steps) to beat its high score
-    stop_train_callback = StopTrainingOnNoModelImprovement(
-        max_no_improvement_evals=40,
-        min_evals=10,
-        verbose=1
-    )
+    # 40 Evaluations Patience
+    stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=40, min_evals=10, verbose=1)
 
-    # Evaluates the model every 10,000 steps
+    # SEPARATE BEST MODEL FOLDERS PER PAIR
     eval_callback = EvalCallback(
         eval_env,
         eval_freq=10000,
         callback_after_eval=stop_train_callback,
-        best_model_save_path='./models/best_model/',
+        best_model_save_path=f'./models/best_model_{ticker}/',
         verbose=1
     )
 
-    # 3. Combine Callbacks
-    checkpoint = CheckpointCallback(save_freq=500000, save_path='./models/', name_prefix='pro_agent')
+    # SEPARATE CHECKPOINTS PER PAIR
+    checkpoint = CheckpointCallback(save_freq=500000, save_path='./models/', name_prefix=f'pro_agent_{ticker}')
     callback_list = CallbackList([checkpoint, eval_callback])
 
-    print("Beginning Training (2 Million Timesteps)...")
-    # Pass the combined callback list here
+    print(f"Beginning Training for {ticker} (2 Million Timesteps)...")
     model.learn(total_timesteps=2000000, callback=callback_list)
 
-    model.save(f"models/pro_lstm_{TICKER}_final")
-    print(f"Model saved as models/pro_lstm_{TICKER}_final.zip")
+    model.save(f"models/pro_lstm_{ticker}_final")
+    print(f"Model saved as models/pro_lstm_{ticker}_final.zip")
 
 
 if __name__ == "__main__":
-    main()
+    # This allows us to pass the ticker from the command line!
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ticker", type=str, required=True, help="The currency pair to train")
+    args = parser.parse_args()
+    main(args.ticker)
