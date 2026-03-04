@@ -5,6 +5,7 @@ import numpy as np
 import time
 import os
 import sys
+import math
 from datetime import datetime
 from sb3_contrib import RecurrentPPO
 
@@ -15,6 +16,8 @@ MAGIC_NUMBER = 999100
 TIMEFRAME = mt5.TIMEFRAME_H1  # The bot trained on H1 data!
 WINDOW_SIZE = 72
 RISK_PERCENT = 0.01  # 1% Risk for the catastrophic Stop Loss
+CLOSE_BEFORE_WEEKEND = True
+FRIDAY_CLOSE_HOUR = 23 # 11:00 PM Local Time
 
 # EXACTLY match the training features
 OBSERVATION_FEATURES = [
@@ -115,8 +118,8 @@ def open_position(target_action, atr_value):
     else:
         return
 
-    # Basic lot sizing (You can replace this with your dynamic lot calc)
-    volume = symbol_info.volume_min
+        # --- THE UPGRADE ---
+    volume = calculate_lot_size(trade_symbol, price, sl)
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -208,19 +211,90 @@ def calculate_features(df):
     df['ATR_Ratio'] = df['H1_ATR'] / (df['H4_ATR'] + 1e-9)
 
     return df
+
+def calculate_lot_size(trade_symbol, entry_price, sl_price):
+    account = mt5.account_info()
+    if not account: return 0.01
+
+    # Calculate exact dollar risk (e.g. $50,000 * 0.01 = $500)
+    risk_amount = account.balance * RISK_PERCENT
+
+    symbol_info = mt5.symbol_info(trade_symbol)
+    if not symbol_info: return 0.01
+
+    # Distance to Stop Loss in raw price points
+    sl_distance = abs(entry_price - sl_price)
+
+    # BULLETPROOF MATH: Loss per 1.0 standard lot = sl_distance * contract_size
+    # For Gold, the contract size is almost always 100 oz.
+    contract_size = symbol_info.trade_contract_size
+    loss_per_lot = sl_distance * contract_size
+
+    if loss_per_lot <= 0:
+        return symbol_info.volume_min
+
+    # Calculate exact lots
+    lots = risk_amount / loss_per_lot
+
+    # Round down to the nearest allowed lot step (usually 0.01)
+    step = symbol_info.volume_step
+    if step > 0:
+        lots = math.floor(lots / step) * step
+
+    # Broker clamps
+    lots = max(lots, symbol_info.volume_min)
+    lots = min(lots, symbol_info.volume_max)
+
+    # 🚨 ULTIMATE FAILSAFE: Never allow the bot to open more than 1.0 lots during early testing
+    lots = min(lots, 1.0)
+
+    return float(f"{lots:.2f}")
+
 # --- MAIN LIVE LOOP ---
 
 print("Bot is live. Waiting for the next H1 candle close...")
 
-# We only want to predict ONCE per hour, right when the new H1 candle opens
 last_processed_hour = -1
+first_run = True  # <--- ADD THIS
 
 while True:
-    time.sleep(1)  # Check every second
+    time.sleep(1)
     current_time = datetime.now()
 
-    if current_time.hour != last_processed_hour and current_time.minute == 0 and current_time.second < 10:
+    # --- WEEKEND SAFETY PROTOCOL ---
+    if CLOSE_BEFORE_WEEKEND:
+        is_weekend = False
+        # If it's Saturday (5), Sunday (6), or past 11 PM on Friday (4)
+        if current_time.weekday() == 5 or current_time.weekday() == 6:
+            is_weekend = True
+        elif current_time.weekday() == 4 and current_time.hour >= FRIDAY_CLOSE_HOUR:
+            is_weekend = True
+
+        if is_weekend:
+            # 1. Force close any open positions
+            current_state, open_pos = get_current_mt5_position()
+            if current_state != 0:
+                print(f"\n--- WEEKEND PROTOCOL TRIGGERED: Liquidating open positions ---")
+                close_position(open_pos)
+                time.sleep(2)  # Give MT5 time to process the close
+
+            # 2. Prevent the AI from running while the market is closed
+            if current_time.minute == 0 and current_time.second < 10:
+                print(f"[{current_time.strftime('%Y-%m-%d %H:%M:%S')}] Weekend mode active. AI is sleeping.")
+                time.sleep(60)  # Sleep through the top of the hour so it doesn't spam
+
+            continue  # Skip the rest of the loop and start over
+    # -------------------------------
+
+    # Fire if it's the top of the hour OR if it's the very first time the script starts
+    if (
+            current_time.hour != last_processed_hour and current_time.minute == 0 and current_time.second < 10) or first_run:
+
         print(f"\n--- AI Evaluation: {current_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+        if first_run:
+            print("  [NOTE] This is an immediate test run on an incomplete H1 candle.")
+
+        first_run = False  # Turn off the bypass after it runs once
 
         # 1. Fetch enough history to calculate indicators + the 72 window
         rates = mt5.copy_rates_from_pos(trade_symbol, TIMEFRAME, 0, 300)
@@ -228,6 +302,7 @@ while True:
 
         df = pd.DataFrame(rates)
         df['time'] = pd.to_datetime(df['time'], unit='s')
+        df.set_index('time', inplace=True)
         df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'tick_volume': 'Volume'},
                   inplace=True)
 
@@ -241,11 +316,9 @@ while True:
 
         # 3. Extract the exact 72x18 grid
         latest_window = df[OBSERVATION_FEATURES].iloc[-WINDOW_SIZE:].values
-        # Match the normalization/clipping from training: np.clip(np.nan_to_num(obs), -5, 5)
         obs = np.clip(np.nan_to_num(latest_window), -5, 5).astype(np.float32)
 
         # 4. Neural Network Prediction
-        # We pass deterministic=True for strict mathematical trading, and update lstm_states
         action, lstm_states = model.predict(obs, state=lstm_states, deterministic=True)
         target_action = int(action)
 
@@ -262,11 +335,10 @@ while True:
             # Step A: Close existing if we have one
             if current_state != 0:
                 close_position(open_pos)
-                time.sleep(1)  # Give MT5 a second to process
+                time.sleep(1)
 
-            # Step B: Open new if target is not flat
+                # Step B: Open new if target is not flat
             if target_action != 0:
-                # We grab a proxy ATR for the hard stop loss calculation
                 current_atr = df['High'].iloc[-1] - df['Low'].iloc[-1]
                 open_position(target_action, current_atr)
 

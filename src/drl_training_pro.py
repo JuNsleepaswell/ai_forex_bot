@@ -3,7 +3,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, StopTrainingOnNoModelImprovement, CallbackList
 import argparse # <--- Add this at the very top of your file with the other imports
 from collections import deque
@@ -23,20 +23,31 @@ OBSERVATION_FEATURES = [
 ]
 
 
+def make_env(df):
+    # This helper function is required for SubprocVecEnv
+    def _init():
+        return ForexTradingEnvPro(df)
+
+    return _init
+
 class ForexTradingEnvPro(gym.Env):
     def __init__(self, df):
         super(ForexTradingEnvPro, self).__init__()
         self.df = df.reset_index(drop=True)
         self.max_steps = len(self.df) - 1
 
-        # --- NEW CONSTRAINTS ---
-        self.MIN_HOLD_TIME = 6  # Agent must hold a position for 6 bars
-        self.hold_timer = 0
+        # --- REMOVED THE ARTIFICIAL LEASH ---
+        # No more MIN_HOLD_TIME or hold_timer. The bot is free.
 
         self.action_space = spaces.Discrete(3)
+
+        # --- NEW: EXPANDED OBSERVATION SPACE ---
+        # We add +2 to the feature length to account for Position and Unrealized PnL
+        self.obs_shape = len(OBSERVATION_FEATURES) + 2
+
         self.observation_space = spaces.Box(
             low=-5, high=5,
-            shape=(WINDOW_SIZE, len(OBSERVATION_FEATURES)),
+            shape=(WINDOW_SIZE, self.obs_shape),
             dtype=np.float32
         )
 
@@ -44,66 +55,77 @@ class ForexTradingEnvPro(gym.Env):
         self.current_step = WINDOW_SIZE
         self.current_position = 0
 
-    def _get_observation(self):
-        # We grab the window of data from the dataframe
-        obs = self.df.loc[self.current_step - WINDOW_SIZE + 1: self.current_step, OBSERVATION_FEATURES].values
+        # NEW: Track the exact price we entered the trade to calculate live PnL
+        self.entry_price = 0.0
 
-        # We use np.nan_to_num to prevent training crashes if a stray NaN exists
-        # We also clip between -5 and 5 to keep gradients stable for the LSTM
+    def _get_observation(self):
+        # 1. Get the base market features
+        obs_df = self.df.loc[self.current_step - WINDOW_SIZE + 1: self.current_step, OBSERVATION_FEATURES].values
+
+        # 2. Calculate Unrealized PnL for the CURRENT step
+        current_close = self.df.loc[self.current_step, 'Close']
+        if self.current_position != 0 and self.entry_price > 0:
+            # Multiplied by 100 so the neural network can clearly "see" the percentage change
+            unrealized_pnl = ((current_close - self.entry_price) / self.entry_price) * self.current_position * 100.0
+        else:
+            unrealized_pnl = 0.0
+
+        # 3. Create the Agent State matrix
+        # We broadcast the current position and PnL across the window so it matches the 2D shape
+        agent_state = np.array([[self.current_position, unrealized_pnl]] * WINDOW_SIZE)
+
+        # 4. Stitch the market data and agent state together
+        obs = np.hstack((obs_df, agent_state))
+
         return np.clip(np.nan_to_num(obs), -5, 5).astype(np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.returns_history.clear()
-        self.hold_timer = 0
 
-        # Ensure we don't start too close to the end of the training set
         train_max = int(self.max_steps * 0.8) - 1
         self.current_step = np.random.randint(WINDOW_SIZE, train_max)
+
+        # Reset internal states
         self.current_position = 0
+        self.entry_price = 0.0
 
         return self._get_observation(), {}
 
     def step(self, action):
         # Action Map: 0=Flat, 1=Long, 2=Short
         target_position = {0: 0, 1: 1, 2: -1}[action]
+        current_close = self.df.loc[self.current_step, 'Close']
 
-        # 1. ENFORCE POSITION LOCK (Keep this, it's good logic to prevent micro-churn)
-        if self.hold_timer > 0:
-            mapped_action = self.current_position
-            self.hold_timer -= 1
-        else:
-            mapped_action = target_position
-            if mapped_action != 0 and mapped_action != self.current_position:
-                self.hold_timer = self.MIN_HOLD_TIME
+        # 1. Update Entry Price Logic
+        if target_position != self.current_position:
+            if target_position != 0:
+                self.entry_price = current_close  # We opened a new trade, record the price
+            else:
+                self.entry_price = 0.0  # We went flat
 
-        # 2. Transaction Costs
-        change_magnitude = abs(mapped_action - self.current_position)
+        # 2. Transaction Costs (The true enemy)
+        change_magnitude = abs(target_position - self.current_position)
         costs = (SPREAD_COST * change_magnitude) + (0.00050 * (change_magnitude > 1))
 
-        # 3. Performance (Log Returns)
-        # CRITICAL FIX: The log return must be multiplied by the PREVIOUS position,
-        # not the newly mapped action, because you hold the position during the step.
-        current_close = self.df.loc[self.current_step, 'Close']
+        # 3. Step PnL (Calculated based on PREVIOUS position)
         prev_close = self.df.loc[self.current_step - 1, 'Close']
         log_return = np.log(current_close / prev_close)
 
         step_pnl = (log_return * self.current_position) - costs
         self.returns_history.append(step_pnl)
 
-        # 4. Pure Rolling Sharpe Reward
-        # No arbitrary penalties. Reward = Average Return / Volatility
-        if len(self.returns_history) < 10:
-             # Just return raw PnL until we have enough history for a standard deviation
-             reward = step_pnl * 10.0 # Small multiplier to keep gradients alive
+        # 4. Pure Sharpe Reward (Removed arbitrary drawdowns/comfort zones)
+        if len(self.returns_history) < 20:
+            reward = step_pnl * 10.0
         else:
             mean_ret = np.mean(self.returns_history)
             std_ret = np.std(self.returns_history) + 1e-8
-            # The Sharpe Ratio * 10 to keep the neural net responsive
+
+            # The agent is rewarded purely for a smooth, upward equity curve
             reward = (mean_ret / std_ret) * 10.0
 
-        # Update position AFTER calculating PnL to prevent the "Phantom Profit" bug
-        self.current_position = mapped_action
+        self.current_position = target_position
         self.current_step += 1
 
         terminated = self.current_step >= self.max_steps
@@ -128,8 +150,9 @@ def main(ticker):
     train_df = df.iloc[:train_split].copy()
     val_df = df.iloc[train_split:val_split].copy()
 
-    env = DummyVecEnv([lambda: ForexTradingEnvPro(train_df)])
-    eval_env = DummyVecEnv([lambda: ForexTradingEnvPro(val_df)])
+    n_envs = 4
+    env = SubprocVecEnv([make_env(train_df) for _ in range(n_envs)])
+    eval_env = SubprocVecEnv([make_env(val_df) for _ in range(n_envs)])
 
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], qf=[256, 256]),
@@ -142,15 +165,14 @@ def main(ticker):
         "MlpLstmPolicy",
         env,
         learning_rate=1e-4,
-        n_steps=8192,
+        n_steps=2048,
         batch_size=512,
-        ent_coef=0.10,
-        gae_lambda=0.95,
+        gamma=0.999,  # <--- The 1,000-hour macro-vision is locked in
+        ent_coef=0.05,
         clip_range=0.2,
-        policy_kwargs=policy_kwargs,
         verbose=1,
         device="cuda",
-        tensorboard_log=f"./tensorboard_logs/{ticker}/"  # SEPARATE GRAPHS PER PAIR
+        tensorboard_log=f"./tensorboard_logs/{ticker}/"
     )
 
     # 40 Evaluations Patience
@@ -173,7 +195,7 @@ def main(ticker):
     model.learn(total_timesteps=2000000, callback=callback_list)
 
     model.save(f"models/pro_lstm_{ticker}_final")
-    print(f"Model saved as models/pro_lstm_{ticker}_final.zip")
+    print(f"Model saved as models/pro_lstm_{ticker}_v2.zip")
 
 
 if __name__ == "__main__":
