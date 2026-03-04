@@ -1,21 +1,13 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
+import os
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-import os
 
-# --- CONFIGURATION ---
-TICKER = "AUDCAD"
-OBSERVATION_FEATURES = [
-    'H1_Norm_Ret_1', 'H1_Norm_Ret_4', 'H1_Norm_Ret_12', 'H1_Norm_Ret_24',
-    'Vol_Regime', 'FracDiff_Close', 'H1_Autocorr', 'H1_ZScore_50',
-    'H1_ER', 'ATR_Ratio', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
-    'Price_Stretch', 'MA_Speed', 'RSI_Velocity', 'ATR_Relative'  # <--- ADDED THESE 4
-]
-
-# Re-defining the Env Class inside or importing it is necessary for the model to load
-from drl_training_pro import ForexTradingEnvPro
+# Ensure your env class is being imported successfully
+from drl_training_pro import ForexTradingEnvPro, OBSERVATION_FEATURES
 
 
 def calculate_max_drawdown(equity_curve):
@@ -25,27 +17,32 @@ def calculate_max_drawdown(equity_curve):
     return drawdown.min() * 100
 
 
-def main():
-    print(f"--- Pro Backtester: Evaluating {TICKER} ---")
+def run_backtest(ticker):
+    print(f"--- Pro Backtester: Evaluating {ticker} ---")
 
-    model_path = "./models/best_model/best_model.zip"
+    # 1. Load the exact matching dataset and model for the requested ticker
+    data_path = f'data/{ticker}_SUPER_dataset.csv'
+    model_path = f"./models/best_model_{ticker}/best_model.zip"
+
+    if not os.path.exists(data_path):
+        print(f"Error: Dataset {data_path} not found.")
+        return
     if not os.path.exists(model_path):
-        print(f"Error: {model_path} not found. Train the model first!")
+        print(f"Error: Model {model_path} not found. Did the training run successfully for {ticker}?")
         return
 
-    # 1. Load the Brain
-    model = RecurrentPPO.load(model_path)
+    df = pd.read_csv(data_path)
 
-    # 2. Load and Prepare Test Data (Last 20% of the dataset)
-    df = pd.read_csv(f'data/{TICKER}_SUPER_dataset.csv')
-    df.dropna(subset=OBSERVATION_FEATURES, inplace=True)
+    # 2. Extract out the test data
+    val_split = int(len(df) * 0.9)
+    test_df = df.iloc[val_split:].copy().reset_index(drop=True)
 
-    test_size = int(len(df) * 0.2)
-    test_df = df.iloc[-test_size:].copy().reset_index(drop=True)
     print(f"Testing on {len(test_df)} unseen hours...")
 
-    # 3. Environment Simulation
+    # 3. Initialize the environment
     env = DummyVecEnv([lambda: ForexTradingEnvPro(test_df)])
+    model = RecurrentPPO.load(model_path, env=env)
+
     obs = env.reset()
 
     # LSTM State tracking
@@ -57,7 +54,7 @@ def main():
     positions = []
     pnl_history = []
 
-    # 4. The Loop
+    # 4. Step through the test data
     for i in range(len(test_df) - 1):
         action, lstm_states = model.predict(
             obs,
@@ -81,25 +78,28 @@ def main():
         if done:
             break
 
-    # 5. Professional Metrics
+    # 5. Calculate Metrics
     total_return = ((equity_curve[-1] - 100000.0) / 100000.0) * 100
     avg_return = np.mean(pnl_history)
     std_return = np.std(pnl_history)
-    sharpe = (avg_return / (std_return + 1e-9)) * np.sqrt(24 * 252)  # Annualized Sharpe
+    sharpe = (avg_return / (std_return + 1e-9)) * np.sqrt(24 * 252)
     max_dd = calculate_max_drawdown(equity_curve)
+
+    # Using np.diff to calculate the number of actual flips (changing positions)
+    total_flips = np.sum(np.abs(np.diff(positions)))
 
     print(f"\n--- Performance Summary ---")
     print(f"Final Balance: ${equity_curve[-1]:,.2f}")
     print(f"Total Return:  {total_return:.2f}%")
     print(f"Annual Sharpe: {sharpe:.2f}")
     print(f"Max Drawdown:  {max_dd:.2f}%")
-    print(f"Total Flips:   {np.sum(np.abs(np.diff(positions)))}")
+    print(f"Total Flips:   {total_flips}")
 
-    # 6. Plotting
+    # 6. Plot the results
     plt.figure(figsize=(15, 8))
     plt.subplot(2, 1, 1)
     plt.plot(equity_curve, label='Equity Curve', color='blue')
-    plt.title(f"Pro Agent Backtest: {TICKER}")
+    plt.title(f"Pro Agent Backtest: {ticker}")
     plt.ylabel("Account Value ($)")
     plt.grid(True, alpha=0.3)
 
@@ -111,4 +111,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ticker", type=str, required=True, help="The currency pair to test")
+    args = parser.parse_args()
+
+    run_backtest(args.ticker)

@@ -68,23 +68,22 @@ class ForexTradingEnvPro(gym.Env):
         # Action Map: 0=Flat, 1=Long, 2=Short
         target_position = {0: 0, 1: 1, 2: -1}[action]
 
-        # 1. ENFORCE POSITION LOCK
-        # If the timer hasn't expired, the agent CANNOT change its mind
+        # 1. ENFORCE POSITION LOCK (Keep this, it's good logic to prevent micro-churn)
         if self.hold_timer > 0:
             mapped_action = self.current_position
             self.hold_timer -= 1
         else:
             mapped_action = target_position
-            # If we just opened a new non-flat position, start the timer
             if mapped_action != 0 and mapped_action != self.current_position:
                 self.hold_timer = self.MIN_HOLD_TIME
 
-        # 2. Harsh Cost Logic
+        # 2. Transaction Costs
         change_magnitude = abs(mapped_action - self.current_position)
-        # We increase CHURN_PENALTY here to 0.00050
         costs = (SPREAD_COST * change_magnitude) + (0.00050 * (change_magnitude > 1))
 
         # 3. Performance (Log Returns)
+        # CRITICAL FIX: The log return must be multiplied by the PREVIOUS position,
+        # not the newly mapped action, because you hold the position during the step.
         current_close = self.df.loc[self.current_step, 'Close']
         prev_close = self.df.loc[self.current_step - 1, 'Close']
         log_return = np.log(current_close / prev_close)
@@ -92,32 +91,18 @@ class ForexTradingEnvPro(gym.Env):
         step_pnl = (log_return * self.current_position) - costs
         self.returns_history.append(step_pnl)
 
-        # 4. Volatility Normalized Reward
-        # 4. Volatility Normalized Reward
-        vol = 1.0
-        if len(self.returns_history) >= 20:
-            vol = np.std(self.returns_history) + 1e-8
-
-        current_atr_rel = self.df.loc[self.current_step, 'ATR_Relative']
-
-        if mapped_action == 0:
-            # THE FOMO RULE: If the market is highly volatile, staying flat hurts slightly
-            if current_atr_rel >= 0.8:
-                reward = -0.001
-            else:
-                reward = 0.0  # Perfect patience in a dead market
+        # 4. Pure Rolling Sharpe Reward
+        # No arbitrary penalties. Reward = Average Return / Volatility
+        if len(self.returns_history) < 10:
+             # Just return raw PnL until we have enough history for a standard deviation
+             reward = step_pnl * 10.0 # Small multiplier to keep gradients alive
         else:
-            if current_atr_rel < 0.8:
-                # The Boredom Penalty: Still hurts to trade in chop
-                reward = step_pnl - 0.002
-            else:
-                # ASYMMETRIC CARROT: Boost the wins, but keep the losses normal
-                norm_pnl = step_pnl / vol
-                if step_pnl > 0:
-                    reward = norm_pnl * 5.0  # 5x multiplier ONLY on winning trades
-                else:
-                    reward = norm_pnl  # Normal penalty for losing trades
+            mean_ret = np.mean(self.returns_history)
+            std_ret = np.std(self.returns_history) + 1e-8
+            # The Sharpe Ratio * 10 to keep the neural net responsive
+            reward = (mean_ret / std_ret) * 10.0
 
+        # Update position AFTER calculating PnL to prevent the "Phantom Profit" bug
         self.current_position = mapped_action
         self.current_step += 1
 

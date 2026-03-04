@@ -19,7 +19,7 @@ DEVIATION = 20
 RISK_PERCENT = 0.01  # 1% Risk per trade
 SL_MULTIPLIER = 1.5  # 1.5 ATR Stop Loss
 TP_MULTIPLIER = 1.0  # 1.0 ATR Take Profit (High Probability Scalp)
-MAX_SPREAD_ATR = 0.15  # Max allowed spread is 15% of H1 ATR
+MAX_SPREAD_ATR = 0.18  # Max allowed spread is 15% of H1 ATR
 
 # --- AI & QUANT SETTINGS ---
 MIN_PROBABILITY = 0.60  # AI must be 60% confident
