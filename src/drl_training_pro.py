@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import gymnasium as gym
+import time # Ensure this is imported
 from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -14,12 +15,13 @@ SPREAD_COST = 0.00018  # Typical spread + slippage buffer
 CHURN_PENALTY = 0.00040
 WINDOW_SIZE = 72
 
-# Updated Observation Features based on Step 2 Enhancement
+# Updated Observation Features to use the "Clean Alpha"
 OBSERVATION_FEATURES = [
-    'H1_Norm_Ret_1', 'H1_Norm_Ret_4', 'H1_Norm_Ret_12', 'H1_Norm_Ret_24',
-    'Vol_Regime', 'FracDiff_Close', 'H1_Autocorr', 'H1_ZScore_50',
-    'H1_ER', 'ATR_Ratio', 'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
-    'Price_Stretch', 'MA_Speed', 'RSI_Velocity','ATR_Relative'  # <--- ADD THESE
+    'FracDiff_Z',      # <--- Our new "Master Signal"
+    'H1_Norm_Ret_1', 'H1_Norm_Ret_4', 'H1_Norm_Ret_12', # Keep these for momentum
+    'Vol_Regime', 'H1_Autocorr', 'H1_ZScore_50',
+    'Hour_Sin', 'Hour_Cos', 'Day_Sin', 'Day_Cos',
+    'RSI_Velocity', 'ATR_Relative'
 ]
 
 
@@ -116,14 +118,19 @@ class ForexTradingEnvPro(gym.Env):
         self.returns_history.append(step_pnl)
 
         # 4. Pure Sharpe Reward (Removed arbitrary drawdowns/comfort zones)
+        # 4. Pure Sharpe Reward
         if len(self.returns_history) < 20:
             reward = step_pnl * 10.0
         else:
             mean_ret = np.mean(self.returns_history)
             std_ret = np.std(self.returns_history) + 1e-8
-
-            # The agent is rewarded purely for a smooth, upward equity curve
             reward = (mean_ret / std_ret) * 10.0
+
+        # --- ADD THE INACTIVITY PENALTY HERE ---
+        if self.current_position == 0:
+            # A tiny negative reward every hour the bot does nothing
+            # This forces it to at least try to find profitable setups
+            reward -= 0.001
 
         self.current_position = target_position
         self.current_step += 1
@@ -132,10 +139,13 @@ class ForexTradingEnvPro(gym.Env):
         return self._get_observation(), reward, terminated, False, {"pnl": step_pnl, "pos": self.current_position}
 
 
-def main(ticker):
-    print(f"--- Deep Reinforcement Learning: PRO Agent ({ticker}) ---")
+def main(ticker, version_id, ent_coef, lr): # <--- Ensure these 4 are here
+    # FIX 2: Use the passed version_id instead of generating a new one
+    run_name = f"{ticker}_{version_id}"
 
-    data_path = f'data/{ticker}_SUPER_dataset.csv'
+    print(f"--- Deep Reinforcement Learning: PRO Agent ({run_name}) ---")
+
+    data_path = f'data/{ticker}_CLEAN_dataset.csv'
     if not os.path.exists(data_path):
         print(f"Error: {data_path} not found. Skipping {ticker}.")
         return
@@ -143,17 +153,18 @@ def main(ticker):
     df = pd.read_csv(data_path)
     df.dropna(subset=OBSERVATION_FEATURES, inplace=True)
 
-    # Split Data: 80% Train, 10% Validation
+    # Split Data
     train_split = int(len(df) * 0.8)
     val_split = int(len(df) * 0.9)
-
     train_df = df.iloc[:train_split].copy()
     val_df = df.iloc[train_split:val_split].copy()
 
-    n_envs = 4
+    # Vectorized Environments
+    n_envs = 2
     env = SubprocVecEnv([make_env(train_df) for _ in range(n_envs)])
     eval_env = SubprocVecEnv([make_env(val_df) for _ in range(n_envs)])
 
+    # Model Configuration
     policy_kwargs = dict(
         net_arch=dict(pi=[256, 256], qf=[256, 256]),
         lstm_hidden_size=256,
@@ -164,43 +175,48 @@ def main(ticker):
     model = RecurrentPPO(
         "MlpLstmPolicy",
         env,
-        learning_rate=1e-4,
+        learning_rate=lr,
         n_steps=2048,
-        batch_size=512,
-        gamma=0.999,  # <--- The 1,000-hour macro-vision is locked in
-        ent_coef=0.05,
+        batch_size=256,
+        gamma=0.999,
+        ent_coef=ent_coef,
         clip_range=0.2,
+        policy_kwargs=policy_kwargs,
         verbose=1,
         device="cuda",
-        tensorboard_log=f"./tensorboard_logs/{ticker}/"
+        tensorboard_log=f"./tensorboard_logs/{run_name}/"
     )
 
-    # 40 Evaluations Patience
+    # --- CALLBACKS ---
     stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=40, min_evals=10, verbose=1)
 
-    # SEPARATE BEST MODEL FOLDERS PER PAIR
+    best_model_path = f'./models/best_model_{run_name}/'
     eval_callback = EvalCallback(
         eval_env,
+        best_model_save_path=best_model_path,
         eval_freq=10000,
         callback_after_eval=stop_train_callback,
-        best_model_save_path=f'./models/best_model_{ticker}/',
         verbose=1
     )
 
-    # SEPARATE CHECKPOINTS PER PAIR
-    checkpoint = CheckpointCallback(save_freq=500000, save_path='./models/', name_prefix=f'pro_agent_{ticker}')
-    callback_list = CallbackList([checkpoint, eval_callback])
+    callback_list = CallbackList([eval_callback])
 
+    # --- START TRAINING ---
     print(f"Beginning Training for {ticker} (2 Million Timesteps)...")
     model.learn(total_timesteps=2000000, callback=callback_list)
 
-    model.save(f"models/pro_lstm_{ticker}_final")
-    print(f"Model saved as models/pro_lstm_{ticker}_v2.zip")
+    final_save_path = f"models/pro_lstm_{run_name}_final"
+    model.save(final_save_path)
+    print(f"✅ Model saved as {final_save_path}.zip")
 
 
 if __name__ == "__main__":
-    # This allows us to pass the ticker from the command line!
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ticker", type=str, required=True, help="The currency pair to train")
+    parser.add_argument("--ticker", type=str, required=True)
+    parser.add_argument("--version", type=str, required=True)
+    # ADD THESE TWO NEW ARGUMENTS:
+    parser.add_argument("--ent_coef", type=float, default=0.05)
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
-    main(args.ticker)
+
+    main(args.ticker, args.version, args.ent_coef, args.lr)

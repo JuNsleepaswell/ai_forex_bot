@@ -6,6 +6,7 @@ import time
 import os
 import sys
 import math
+import glob
 from datetime import datetime
 from sb3_contrib import RecurrentPPO
 
@@ -27,6 +28,38 @@ OBSERVATION_FEATURES = [
     'Price_Stretch', 'MA_Speed', 'RSI_Velocity', 'ATR_Relative'
 ]
 
+
+def get_latest_model(ticker):
+    """
+    Priority:
+    1. best_model.zip (Highest performance during validation)
+    2. pro_lstm_{ticker}_final_v2.zip (The latest completed training)
+    3. Any pro_lstm_{ticker}*.zip (Fall-back)
+    """
+    paths = [
+        f"./models/best_model_{ticker}/best_model.zip",
+        f"models/pro_lstm_{ticker}_final_v2.zip",
+        f"models/pro_lstm_{ticker}_v2.zip"
+    ]
+
+    # Check our priority list first
+    for path in paths:
+        if os.path.exists(path):
+            print(f"✅ Found prioritized model: {path}")
+            return path
+
+    # If none of those exist, search the models folder for anything related to this ticker
+    wildcard_path = f"models/*{ticker}*.zip"
+    available_files = glob.glob(wildcard_path)
+
+    if available_files:
+        # Sort by modification time to get the absolute newest file
+        latest_file = max(available_files, key=os.path.getmtime)
+        print(f"⚠️ Priority models missing. Using latest found file: {latest_file}")
+        return latest_file
+
+    return None
+
 print(f"--- AI Forex Bot: DRL PRO Sniper ({TICKER}) ---")
 
 # 1. Initialize MT5
@@ -42,15 +75,18 @@ if not mt5.symbol_select(trade_symbol, True):
     sys.exit()
 
 # 2. Load the Brain
-model_path = f"./models/best_model_{TICKER}/best_model.zip"
-if not os.path.exists(model_path):
-    print(f"Error: Could not find {model_path}")
+model_path = get_latest_model(TICKER)
+
+if not model_path:
+    print(f"❌ ERROR: No model found for {TICKER} in ./models/")
     sys.exit()
+
+print(f"🧠 Loading LSTM Brain: {os.path.basename(model_path)}")
+model = RecurrentPPO.load(model_path)
 
 print("Loading LSTM Network...")
 model = RecurrentPPO.load(model_path)
 lstm_states = None  # The bot's short-term memory
-
 
 # --- HELPER FUNCTIONS ---
 
@@ -104,21 +140,29 @@ def open_position(target_action, atr_value):
     tick = mt5.symbol_info_tick(trade_symbol)
     symbol_info = mt5.symbol_info(trade_symbol)
 
-    # The AI manages exits, but we use a 3x ATR hard stop just in case MT5 crashes
+    if tick is None or symbol_info is None:
+        print(f"  [ERROR] Could not get symbol info for {trade_symbol}")
+        return
+
+    # The AI manages exits, but we use a 3x ATR hard stop for safety
     hard_sl_distance = atr_value * 3.0
+    hard_tp_distance = atr_value * 6.0  # 2:1 Ratio failsafe
 
     if target_action == 1:  # LONG
         order_type = mt5.ORDER_TYPE_BUY
         price = tick.ask
         sl = price - hard_sl_distance
+        tp = price + hard_tp_distance
     elif target_action == 2:  # SHORT
         order_type = mt5.ORDER_TYPE_SELL
         price = tick.bid
         sl = price + hard_sl_distance
+        tp = price - hard_tp_distance
     else:
         return
 
-        # --- THE UPGRADE ---
+    # --- INDENTATION FIXED HERE ---
+    # These must be at the same level as the 'if/elif' blocks
     volume = calculate_lot_size(trade_symbol, price, sl)
 
     request = {
@@ -128,6 +172,7 @@ def open_position(target_action, atr_value):
         "type": order_type,
         "price": float(round(price, symbol_info.digits)),
         "sl": float(round(sl, symbol_info.digits)),
+        "tp": float(round(tp, symbol_info.digits)),
         "deviation": 20,
         "magic": MAGIC_NUMBER,
         "comment": "AI DRL Open",
@@ -136,11 +181,16 @@ def open_position(target_action, atr_value):
     }
 
     result = mt5.order_send(request)
+
+    if result is None:
+        print("  [ERROR] Order send returned None. Check internet/MT5 connection.")
+        return
+
     if result.retcode == mt5.TRADE_RETCODE_DONE:
         direction = "LONG" if target_action == 1 else "SHORT"
         print(f"  [OPENED] {direction} at {price} (Vol: {volume})")
     else:
-        print(f"  [ERROR] Failed to open position: {result.comment}")
+        print(f"  [ERROR] Failed to open position: {result.comment} (Code: {result.retcode})")
 
 
 def apply_frac_diff(series, d=0.4):  # Matched to your d=0.4 call
@@ -314,11 +364,30 @@ while True:
             print("  Not enough data to form a 72-hour window. Skipping.")
             continue
 
-        # 3. Extract the exact 72x18 grid
+        # 3. Extract Market Features
         latest_window = df[OBSERVATION_FEATURES].iloc[-WINDOW_SIZE:].values
-        obs = np.clip(np.nan_to_num(latest_window), -5, 5).astype(np.float32)
+
+        # --- NEW: SELF-AWARE AGENT STATE ---
+        current_state, open_pos = get_current_mt5_position()
+        unrealized_pnl = 0.0
+
+        if current_state != 0 and open_pos is not None:
+            entry_price = open_pos.price_open
+            current_close = df['Close'].iloc[-1]
+            # Match training math: (pct_change * direction * 100)
+            direction = 1 if current_state == 1 else -1
+            unrealized_pnl = ((current_close - entry_price) / (entry_price + 1e-9)) * direction * 100.0
+
+        # Broadcast the [Position, PnL] across the 72-hour window
+        agent_state = np.array([[current_state, unrealized_pnl]] * WINDOW_SIZE)
+
+        # Stack Market + Agent State = 72x20 Matrix
+        obs = np.hstack((latest_window, agent_state))
+        obs = np.clip(np.nan_to_num(obs), -5, 5).astype(np.float32)
+        # ------------------------------------
 
         # 4. Neural Network Prediction
+        # Note: We pass the obs with a new axis [None, ...] because SB3 expects (Batch, Window, Features)
         action, lstm_states = model.predict(obs, state=lstm_states, deterministic=True)
         target_action = int(action)
 

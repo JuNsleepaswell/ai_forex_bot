@@ -6,7 +6,7 @@ import os
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-# Ensure your env class is being imported successfully
+# IMPORT THE NEW CLASS DIRECTLY TO SYNC LOGIC
 from drl_training_pro import ForexTradingEnvPro, OBSERVATION_FEATURES
 
 
@@ -17,35 +17,39 @@ def calculate_max_drawdown(equity_curve):
     return drawdown.min() * 100
 
 
-def run_backtest(ticker):
-    print(f"--- Pro Backtester: Evaluating {ticker} ---")
+def run_backtest(ticker, version): # 1. Added version parameter
+    print(f"--- Pro Backtester v2: Evaluating {ticker} (Version: {version}) ---")
 
-    # 1. Load the exact matching dataset and model for the requested ticker
-    data_path = f'data/{ticker}_SUPER_dataset.csv'
-    model_path = f"./models/best_model_{ticker}/best_model.zip"
+    data_path = f'data/{ticker}_CLEAN_dataset.csv'
 
-    if not os.path.exists(data_path):
-        print(f"Error: Dataset {data_path} not found.")
-        return
-    if not os.path.exists(model_path):
-        print(f"Error: Model {model_path} not found. Did the training run successfully for {ticker}?")
+    # 2. UPDATED PATH LOGIC: Use the version string provided by the user
+    best_path = f"./models/best_model_{ticker}_{version}/best_model.zip"
+    final_path = f"models/pro_lstm_{ticker}_{version}_final.zip"
+
+    if os.path.exists(best_path):
+        model_path = best_path
+        print(f"  [Status] Loading BEST model from validation phase.")
+    elif os.path.exists(final_path):
+        model_path = final_path
+        print(f"  [Status] Loading FINAL model from end of training.")
+    else:
+        # This will now tell you EXACTLY where it looked and failed
+        print(f"  [Error] No model found at:")
+        print(f"   - {best_path}")
+        print(f"   - {final_path}")
         return
 
     df = pd.read_csv(data_path)
-
-    # 2. Extract out the test data
-    val_split = int(len(df) * 0.9)
+    val_split = int(len(df) * 0.9)  # Test on the final 10% (pure unseen data)
     test_df = df.iloc[val_split:].copy().reset_index(drop=True)
 
-    print(f"Testing on {len(test_df)} unseen hours...")
+    print(f"  [Data] Testing on {len(test_df)} unseen hours...")
 
-    # 3. Initialize the environment
+    # Initialize Env (The class now handles the +2 features internally)
     env = DummyVecEnv([lambda: ForexTradingEnvPro(test_df)])
     model = RecurrentPPO.load(model_path, env=env)
 
     obs = env.reset()
-
-    # LSTM State tracking
     lstm_states = None
     episode_starts = np.ones((env.num_envs,), dtype=bool)
 
@@ -54,8 +58,8 @@ def run_backtest(ticker):
     positions = []
     pnl_history = []
 
-    # 4. Step through the test data
     for i in range(len(test_df) - 1):
+        # Predict with LSTM state tracking
         action, lstm_states = model.predict(
             obs,
             state=lstm_states,
@@ -66,7 +70,6 @@ def run_backtest(ticker):
         obs, reward, done, info = env.step(action)
         episode_starts = done
 
-        # Extract real PnL from info
         step_pnl_pct = info[0]['pnl']
         dollar_pnl = current_equity * step_pnl_pct
 
@@ -78,28 +81,26 @@ def run_backtest(ticker):
         if done:
             break
 
-    # 5. Calculate Metrics
+    # Metrics
     total_return = ((equity_curve[-1] - 100000.0) / 100000.0) * 100
     avg_return = np.mean(pnl_history)
-    std_return = np.std(pnl_history)
-    sharpe = (avg_return / (std_return + 1e-9)) * np.sqrt(24 * 252)
+    std_return = np.std(pnl_history) + 1e-9
+    sharpe = (avg_return / std_return) * np.sqrt(24 * 252)
     max_dd = calculate_max_drawdown(equity_curve)
-
-    # Using np.diff to calculate the number of actual flips (changing positions)
     total_flips = np.sum(np.abs(np.diff(positions)))
 
-    print(f"\n--- Performance Summary ---")
+    print(f"\n--- Performance Summary: {ticker} ---")
     print(f"Final Balance: ${equity_curve[-1]:,.2f}")
     print(f"Total Return:  {total_return:.2f}%")
     print(f"Annual Sharpe: {sharpe:.2f}")
     print(f"Max Drawdown:  {max_dd:.2f}%")
     print(f"Total Flips:   {total_flips}")
 
-    # 6. Plot the results
+    # Plot
     plt.figure(figsize=(15, 8))
     plt.subplot(2, 1, 1)
     plt.plot(equity_curve, label='Equity Curve', color='blue')
-    plt.title(f"Pro Agent Backtest: {ticker}")
+    plt.title(f"Pro Agent Backtest v2: {ticker}")
     plt.ylabel("Account Value ($)")
     plt.grid(True, alpha=0.3)
 
@@ -112,7 +113,9 @@ def run_backtest(ticker):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ticker", type=str, required=True, help="The currency pair to test")
+    parser.add_argument("--ticker", type=str, required=True)
+    parser.add_argument("--version", type=str, required=True, help="Format: YYYYMMDD_HHMM_Targeted")
     args = parser.parse_args()
 
-    run_backtest(args.ticker)
+    # 3. Pass both arguments to the function
+    run_backtest(args.ticker, args.version)
