@@ -335,6 +335,27 @@ def bars_held_since_open(position) -> int:
     return int(elapsed.total_seconds() / 3600)
 
 
+_filling_logged = False  # log chosen filling mode once per session
+
+
+def _resolve_filling(mt5) -> int:
+    """Return the first ORDER_FILLING constant the symbol actually supports."""
+    global _filling_logged
+    info = mt5.symbol_info(SYMBOL)
+    mask = info.filling_mode if info is not None else 0
+    # Bitmask: bit-0 = FOK (1), bit-1 = IOC (2), bit-2 = RETURN (4)
+    if mask & 1:
+        mode, name = mt5.ORDER_FILLING_FOK, "FOK"
+    elif mask & 2:
+        mode, name = mt5.ORDER_FILLING_IOC, "IOC"
+    else:
+        mode, name = mt5.ORDER_FILLING_RETURN, "RETURN"
+    if not _filling_logged:
+        print(f"[ORDER] filling_mode bitmask={mask}  selected={name} ({mode})")
+        _filling_logged = True
+    return mode
+
+
 def close_position(mt5, position) -> bool:
     order_type = mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY
     tick = mt5.symbol_info_tick(SYMBOL)
@@ -351,11 +372,14 @@ def close_position(mt5, position) -> bool:
         "magic":     MAGIC,
         "comment":   "xgb_close",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _resolve_filling(mt5),
     }
     result = mt5.order_send(req)
     ok = result.retcode == mt5.TRADE_RETCODE_DONE
-    print(f"[CLOSE] ticket={position.ticket}  retcode={result.retcode}  {'OK' if ok else 'FAIL'}")
+    if ok:
+        print(f"[CLOSE] ticket={position.ticket}  retcode={result.retcode}  OK")
+    else:
+        print(f"[CLOSE] FAIL ticket={position.ticket}  retcode={result.retcode}  comment='{result.comment}'")
     return ok
 
 
@@ -379,12 +403,15 @@ def open_position(mt5, direction: int) -> bool:
         "magic":     MAGIC,
         "comment":   "xgb_entry",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_filling": _resolve_filling(mt5),
     }
     result = mt5.order_send(req)
     ok = result.retcode == mt5.TRADE_RETCODE_DONE
-    print(f"[OPEN] dir={'BUY' if direction==1 else 'SELL'}  price={price}  "
-          f"retcode={result.retcode}  {'OK' if ok else 'FAIL'}")
+    if ok:
+        print(f"[OPEN] dir={'BUY' if direction==1 else 'SELL'}  price={price}  retcode={result.retcode}  OK")
+    else:
+        print(f"[OPEN] FAIL dir={'BUY' if direction==1 else 'SELL'}  price={price}  "
+              f"retcode={result.retcode}  comment='{result.comment}'")
     return ok
 
 
@@ -548,8 +575,9 @@ def run(
 
         if pos is not None:
             pos_dir = 1 if pos.type == 0 else -1  # MT5: type 0=BUY, 1=SELL
-            # Exit on an opposite (non-flat) signal once min-hold is satisfied
-            if can_exit and signal != 0 and signal != pos_dir:
+            # Exit when signal differs from current direction (including FLAT=0),
+            # matching _apply_min_hold: out[i]=0 on any raw_sig != cur once unlocked.
+            if can_exit and signal != pos_dir:
                 print(f"[EXEC] Close {'BUY' if pos.type==0 else 'SELL'}  "
                       f"held={bars_held}h  min_hold={MIN_HOLD_HOURS}h")
                 close_position(mt5, pos)
