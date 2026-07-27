@@ -70,8 +70,8 @@ CHALLENGE_STATE_PATH = os.path.join("live_logs", "challenge_state.json")
 #   5 pm ET = 22:00 UTC in winter (EST) / 21:00 UTC in summer (EDT)
 # Set to 0 for a straight UTC-midnight reset.
 # IMPORTANT: Verify your exact account type at dashboard.fundingpips.com
-# Current setting: 22:00 UTC (EST / winter).  Change to 21 when clocks spring forward.
-DAILY_RESET_HOUR_UTC = 22
+# Confirmed from FundingPips dashboard countdown: resets at 21:00 UTC.
+DAILY_RESET_HOUR_UTC = 21
 
 # ── DRAWDOWN TYPE ─────────────────────────────────────────────────────────────
 # False = STATIC floor (confirmed FundingPips $10k standard challenge):
