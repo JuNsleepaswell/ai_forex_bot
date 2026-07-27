@@ -234,7 +234,7 @@ def save_model(clf, path: str = MODEL_PATH) -> None:
 def load_model(path: str = MODEL_PATH):
     with open(path, "rb") as f:
         clf = pickle.load(f)
-    print(f"[MODEL] Loaded ← {path}")
+    print(f"[MODEL] Loaded <- {path}")
     return clf
 
 
@@ -303,6 +303,40 @@ def connect_mt5(mt5) -> None:
     info = mt5.account_info()
     print(f"[MT5] Connected  account={info.login}  balance={info.balance:.2f}  "
           f"server={info.server}")
+
+
+def print_broker_constraints(mt5) -> float:
+    """
+    Print SYMBOL constraints from the broker and return the minimum safe SL
+    distance in price units (stops_level + 5 points buffer).
+
+    The buffer prevents retcode 10016 (invalid stops) when the ATR-based SL
+    lands inside the broker's forbidden zone around the current price.
+    """
+    si = mt5.symbol_info(SYMBOL)
+    if si is None:
+        print(f"[BROKER] WARNING: symbol_info({SYMBOL}) returned None — "
+              f"SL clamping disabled")
+        return 0.0
+
+    point     = si.point                    # e.g. 0.00001 for 5-digit broker
+    stops_lvl = si.trade_stops_level        # minimum distance in points
+    # Add 5 points of breathing room above the hard minimum
+    min_dist  = (stops_lvl + 5) * point
+
+    print(f"[BROKER] {SYMBOL} constraints:")
+    print(f"[BROKER]   digits          = {si.digits}")
+    print(f"[BROKER]   point           = {point}")
+    print(f"[BROKER]   stops_level     = {stops_lvl} points  "
+          f"({stops_lvl * point / PIP:.1f} pips)")
+    print(f"[BROKER]   SL clamped to  >= {min_dist / PIP:.1f} pips  "
+          f"(stops_level + 5 point buffer)")
+    print(f"[BROKER]   volume_min      = {si.volume_min}")
+    print(f"[BROKER]   volume_max      = {si.volume_max}")
+    print(f"[BROKER]   volume_step     = {si.volume_step}")
+    print(f"[BROKER]   spread (now)    = {si.spread} points  "
+          f"({si.spread * point / PIP:.1f} pips)")
+    return min_dist
 
 
 def get_h1_bars(mt5, n: int = FEATURE_BUFFER) -> pd.DataFrame:
@@ -600,6 +634,9 @@ def run(
     mt5 = _mt5_import()
     connect_mt5(mt5)
 
+    # Print broker constraints; capture minimum SL distance for clamping.
+    min_sl_dist = print_broker_constraints(mt5)
+
     challenge_eq = _load_or_init_challenge_equity(mt5)
     risk_guard   = RiskGuard(mt5, challenge_eq)
     _ensure_log(LOG_PATH)
@@ -701,7 +738,13 @@ def run(
                 time.sleep(1)  # brief pause before re-entering on same bar
 
         if pos is None and signal != 0 and can_enter:
-            sl_dist  = ATR_SL_MULT * atr_value
+            atr_dist = ATR_SL_MULT * atr_value
+            # Clamp SL distance to broker minimum (stops_level + buffer) so the
+            # order is never rejected with retcode 10016 (invalid stops).
+            sl_dist  = max(atr_dist, min_sl_dist)
+            if sl_dist > atr_dist:
+                print(f"[RISK] SL clamped: ATR gave {atr_dist/PIP:.1f}pip, "
+                      f"broker minimum is {min_sl_dist/PIP:.1f}pip")
             sl_price = close_price - sl_dist if signal == 1 else close_price + sl_dist
             equity   = mt5.account_info().equity
             lot_size = compute_lot_size(equity, sl_dist)
@@ -715,6 +758,10 @@ def run(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Reconfigure stdout to UTF-8 so non-ASCII in print() doesn't crash on
+    # Windows terminals that default to cp1252.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="AUDUSD XGBoost Live Trader (MT5 Demo)")
     parser.add_argument("--no_retrain",     action="store_true",
                         help="Load existing model instead of retraining")
