@@ -48,8 +48,8 @@ SESSION_END_UTC   = 16
 # Fill in FundingPips' actual numbers; placeholders below are conservative.
 # The bot halts BEFORE the hard limit by the buffer so there is headroom for
 # a position that is already open to be closed without breaching the rule.
-MAX_DAILY_LOSS_PCT      = 4.0   # FundingPips hard daily loss limit (% of day-start equity)
-MAX_TOTAL_DRAWDOWN_PCT  = 8.0   # FundingPips hard total drawdown limit (% of challenge start)
+MAX_DAILY_LOSS_PCT      = 4.0   # FundingPips: 4% of day-start equity = $400 on a $10k account
+MAX_TOTAL_DRAWDOWN_PCT  = 12.0  # FundingPips: max loss = $1,200 on $10k = fixed $8,800 floor
 DAILY_HALT_BUFFER_PCT   = 0.5   # halt this many % BEFORE the hard daily limit
 TOTAL_DD_BUFFER_PCT     = 0.5   # halt this many % BEFORE the hard total limit
 
@@ -73,12 +73,12 @@ CHALLENGE_STATE_PATH = os.path.join("live_logs", "challenge_state.json")
 # Current setting: 22:00 UTC (EST / winter).  Change to 21 when clocks spring forward.
 DAILY_RESET_HOUR_UTC = 22
 
-# ── TRAILING vs STATIC DRAWDOWN ───────────────────────────────────────────────
-# True  = FundingPips standard: drawdown floor follows your equity HIGH-WATER MARK
-#         upward as you profit, so the allowed loss is always measured from peak.
-# False = simpler static: floor is pinned at challenge_start_equity forever.
-# FundingPips standard challenges use TRAILING.  Verify for your specific plan.
-TRAILING_DRAWDOWN = True
+# ── DRAWDOWN TYPE ─────────────────────────────────────────────────────────────
+# False = STATIC floor (confirmed FundingPips $10k standard challenge):
+#   The absolute floor is fixed at challenge_start * (1 - MAX_TOTAL_DRAWDOWN_PCT/100).
+#   On a $10k account: floor = $10,000 * 0.88 = $8,800.  It never moves.
+#   Equity is compared directly against this fixed floor — no HWM tracking.
+TRAILING_DRAWDOWN = False
 
 LONG_THRESHOLD  = 0.65
 SHORT_THRESHOLD = 0.65
@@ -548,19 +548,15 @@ class RiskGuard:
     Enforces two independent drawdown limits using EQUITY (balance + floating P&L).
 
     DAILY
-      Equity is compared to the day-start equity, where "day" resets at
-      DAILY_RESET_HOUR_UTC (default 22:00 UTC = 5pm ET / New York close).
+      Equity vs day-start equity; day boundary at DAILY_RESET_HOUR_UTC.
       Halts when loss >= MAX_DAILY_LOSS_PCT - DAILY_HALT_BUFFER_PCT.
       Resets automatically at the next period boundary.
 
     TOTAL (permanent until manual restart)
-      If TRAILING_DRAWDOWN = True (FundingPips standard):
-        The reference tracks your peak equity (high-water mark).
-        Drawdown = (peak_equity - current_equity) / challenge_start * 100
-        The floor rises as you profit, matching FundingPips' trailing rule.
-      If TRAILING_DRAWDOWN = False:
-        Drawdown is static from challenge_start_equity.
-      Halts when >= MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT.
+      STATIC floor: challenge_start * (1 - MAX_TOTAL_DRAWDOWN_PCT/100).
+      On a $10k FundingPips account: hard floor = $8,800; soft halt = $8,850.
+      Equity is compared directly against this fixed floor — no HWM tracking.
+      Halts permanently when equity <= soft_floor.
     """
 
     @staticmethod
@@ -579,22 +575,23 @@ class RiskGuard:
         now                   = datetime.now(timezone.utc)
         eq                    = mt5.account_info().equity
         self._day_start_eq    = eq
-        self._peak_equity     = eq          # high-water mark for trailing DD
         self._period          = self._trading_period(now)
         self._daily_halted    = False
         self._total_halted    = False
 
-        daily_soft = MAX_DAILY_LOSS_PCT    - DAILY_HALT_BUFFER_PCT
-        total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
-        dd_type    = "TRAILING (HWM)" if TRAILING_DRAWDOWN else "STATIC"
-        reset_desc = f"{DAILY_RESET_HOUR_UTC:02d}:00 UTC"
+        daily_soft      = MAX_DAILY_LOSS_PCT    - DAILY_HALT_BUFFER_PCT
+        total_soft      = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
+        hard_floor      = challenge_start_eq * (1.0 - MAX_TOTAL_DRAWDOWN_PCT / 100.0)
+        soft_floor      = challenge_start_eq * (1.0 - total_soft / 100.0)
+        reset_desc      = f"{DAILY_RESET_HOUR_UTC:02d}:00 UTC"
 
-        print(f"[RISK] Day-start equity       = {self._day_start_eq:.2f}")
+        print(f"[RISK] Day-start equity       = {eq:.2f}")
         print(f"[RISK] Challenge-start equity  = {self._challenge_start:.2f}")
         print(f"[RISK] Daily reset at          {reset_desc}  (DAILY_RESET_HOUR_UTC={DAILY_RESET_HOUR_UTC})")
         print(f"[RISK] Daily halt at          -{daily_soft:.1f}%  (hard limit -{MAX_DAILY_LOSS_PCT:.1f}%)")
-        print(f"[RISK] Total DD type           {dd_type}")
-        print(f"[RISK] Total DD halt at       -{total_soft:.1f}%  (hard limit -{MAX_TOTAL_DRAWDOWN_PCT:.1f}%)")
+        print(f"[RISK] Total DD type           STATIC fixed floor")
+        print(f"[RISK] Total DD hard floor     {hard_floor:.2f}  (-{MAX_TOTAL_DRAWDOWN_PCT:.1f}%)")
+        print(f"[RISK] Total DD soft floor     {soft_floor:.2f}  (-{total_soft:.1f}% — halt triggers here)")
 
     def _reset_if_new_period(self) -> None:
         now    = datetime.now(timezone.utc)
@@ -621,22 +618,15 @@ class RiskGuard:
 
         eq = self._mt5.account_info().equity
 
-        # Update high-water mark BEFORE computing trailing DD.
-        self._peak_equity = max(self._peak_equity, eq)
-
-        # ── Total drawdown ────────────────────────────────────────────────────
+        # ── Total drawdown — static fixed floor ───────────────────────────────
+        # FundingPips $10k: floor fixed at $8,800.  Equity must stay above it.
         total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
-        if TRAILING_DRAWDOWN:
-            # Drawdown from peak; % expressed relative to challenge start balance.
-            total_dd  = (self._peak_equity - eq) / self._challenge_start * 100.0
-            dd_ref    = f"HWM={self._peak_equity:.2f}"
-        else:
-            total_dd  = (self._challenge_start - eq) / self._challenge_start * 100.0
-            dd_ref    = f"start={self._challenge_start:.2f}"
+        soft_floor = self._challenge_start * (1.0 - total_soft / 100.0)
+        total_dd   = (self._challenge_start - eq) / self._challenge_start * 100.0
 
-        if total_dd >= total_soft:
-            print(f"[RISK] TOTAL DD {total_dd:.2f}% >= soft limit {total_soft:.1f}% "
-                  f"({dd_ref}, hard = {MAX_TOTAL_DRAWDOWN_PCT:.1f}%) — PERMANENT HALT")
+        if eq <= soft_floor:
+            print(f"[RISK] TOTAL DD {total_dd:.2f}% — equity {eq:.2f} <= soft floor {soft_floor:.2f} "
+                  f"(hard = -{MAX_TOTAL_DRAWDOWN_PCT:.1f}%) — PERMANENT HALT")
             print(f"[RISK] Delete {CHALLENGE_STATE_PATH} and restart to reset.")
             if pos is not None:
                 print("[RISK] Closing open position before halting.")
