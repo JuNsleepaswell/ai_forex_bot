@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 """
-AUDUSD XGBoost Live Trader — MT5 Demo Account
+AUDUSD XGBoost Live Trader — MT5 / Prop-Firm Account
 
 Features computed on CLOSED H1 bars only (start_pos=1 in copy_rates_from_pos
 skips the currently-forming bar).  Every signal is logged to CSV so live
 behaviour can be compared against backtest assumptions later.
 
-Hard risk limits
-  - Max 1 open AUDUSD position at any time
-  - Fixed 0.01 lots per trade
-  - Stop trading for the day if daily loss exceeds 2 % of session-opening balance
+Risk layer (all configurable in the PROP-FIRM RISK LIMITS block below)
+  - ATR-based hard stop-loss on every order (no naked positions)
+  - Dynamic lot sizing: risk RISK_PCT_PER_TRADE% of equity per trade
+  - Daily loss halt: close position and stop if equity drops DAILY_HALT_BUFFER_PCT
+    below MAX_DAILY_LOSS_PCT; resets at UTC midnight
+  - Total drawdown circuit breaker: permanent halt if equity drops
+    TOTAL_DD_BUFFER_PCT below MAX_TOTAL_DRAWDOWN_PCT vs challenge start equity
+    (persisted to live_logs/challenge_state.json; delete file to reset)
 
 Usage
-  # First run: train and save model, then start live loop
-  python src/live_audusd_xgb.py
-
-  # Skip retrain if model already saved
-  python src/live_audusd_xgb.py --no_retrain
-
-  # Session filter: only enter trades 13:00-16:00 UTC
+  python src/live_audusd_xgb.py                 # train + live loop
+  python src/live_audusd_xgb.py --no_retrain    # skip retrain
   python src/live_audusd_xgb.py --session_filter
+  python src/live_audusd_xgb.py --dry_run
 """
 
 import argparse
 import csv
+import json
 import os
 import pickle
 import sys
@@ -38,12 +39,30 @@ import pandas_ta as ta
 # Constants
 # ---------------------------------------------------------------------------
 
-SYMBOL             = "AUDUSD"
-MAGIC              = 20260614
-LOTS               = 0.01
-MAX_DAILY_LOSS_PCT = 2.0        # halt if (start_bal - current_bal) / start_bal >= this
-SESSION_START_UTC  = 13         # only used with --session_filter
-SESSION_END_UTC    = 16
+SYMBOL            = "AUDUSD"
+MAGIC             = 20260614
+SESSION_START_UTC = 13          # only used with --session_filter
+SESSION_END_UTC   = 16
+
+# ── PROP-FIRM RISK LIMITS ─────────────────────────────────────────────────────
+# Fill in FundingPips' actual numbers; placeholders below are conservative.
+# The bot halts BEFORE the hard limit by the buffer so there is headroom for
+# a position that is already open to be closed without breaching the rule.
+MAX_DAILY_LOSS_PCT      = 4.0   # FundingPips hard daily loss limit (% of day-start equity)
+MAX_TOTAL_DRAWDOWN_PCT  = 8.0   # FundingPips hard total drawdown limit (% of challenge start)
+DAILY_HALT_BUFFER_PCT   = 0.5   # halt this many % BEFORE the hard daily limit
+TOTAL_DD_BUFFER_PCT     = 0.5   # halt this many % BEFORE the hard total limit
+
+# ── POSITION SIZING ───────────────────────────────────────────────────────────
+RISK_PCT_PER_TRADE = 0.5        # % of current equity to risk per trade
+ATR_SL_MULT        = 1.5        # stop-loss = ATR_SL_MULT × H1 ATR (in price units)
+PIP                = 0.0001     # AUDUSD pip size
+PIP_VALUE_PER_LOT  = 10.0       # USD per pip per standard lot (AUDUSD, USD account)
+MIN_LOTS           = 0.01       # broker minimum
+MAX_LOTS           = 1.0        # self-imposed cap per trade
+LOT_STEP           = 0.01       # broker lot increment
+
+CHALLENGE_STATE_PATH = os.path.join("live_logs", "challenge_state.json")
 
 LONG_THRESHOLD  = 0.65
 SHORT_THRESHOLD = 0.65
@@ -383,8 +402,12 @@ def close_position(mt5, position) -> bool:
     return ok
 
 
-def open_position(mt5, direction: int) -> bool:
-    """direction: 1 = long, -1 = short."""
+def open_position(mt5, direction: int, sl_price: float, lot_size: float) -> bool:
+    """
+    direction: 1 = long, -1 = short.
+    sl_price:  hard stop-loss price sent with the order (ATR-based).
+    lot_size:  dynamically sized to risk RISK_PCT_PER_TRADE% of equity.
+    """
     tick = mt5.symbol_info_tick(SYMBOL)
     if tick is None:
         print("[OPEN] No tick data — skipping")
@@ -396,9 +419,10 @@ def open_position(mt5, direction: int) -> bool:
     req = {
         "action":    mt5.TRADE_ACTION_DEAL,
         "symbol":    SYMBOL,
-        "volume":    LOTS,
+        "volume":    lot_size,
         "type":      order_type,
         "price":     price,
+        "sl":        round(sl_price, 5),
         "deviation": 10,
         "magic":     MAGIC,
         "comment":   "xgb_entry",
@@ -407,44 +431,134 @@ def open_position(mt5, direction: int) -> bool:
     }
     result = mt5.order_send(req)
     ok = result.retcode == mt5.TRADE_RETCODE_DONE
+    sl_pips = abs(price - sl_price) / PIP
     if ok:
-        print(f"[OPEN] dir={'BUY' if direction==1 else 'SELL'}  price={price}  retcode={result.retcode}  OK")
+        print(f"[OPEN] {'BUY' if direction==1 else 'SELL'}  price={price:.5f}  "
+              f"sl={sl_price:.5f} ({sl_pips:.1f}pip)  lots={lot_size}  retcode={result.retcode}  OK")
     else:
-        print(f"[OPEN] FAIL dir={'BUY' if direction==1 else 'SELL'}  price={price}  "
+        print(f"[OPEN] FAIL {'BUY' if direction==1 else 'SELL'}  price={price:.5f}  "
               f"retcode={result.retcode}  comment='{result.comment}'")
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Daily risk tracking
+# Risk management
 # ---------------------------------------------------------------------------
 
-class DailyRiskGuard:
-    def __init__(self, mt5):
-        self._mt5        = mt5
-        self._start_bal  = mt5.account_info().balance
-        self._trade_date = datetime.now(timezone.utc).date()
-        self._halted     = False
-        print(f"[RISK] Session opening balance = {self._start_bal:.2f}")
+def _load_or_init_challenge_equity(mt5) -> float:
+    """
+    Load challenge-start equity from disk so it survives restarts.
+    On first run the current equity is written as the baseline.
+    Delete CHALLENGE_STATE_PATH to reset the circuit breaker.
+    """
+    os.makedirs(os.path.dirname(CHALLENGE_STATE_PATH), exist_ok=True)
+    if os.path.exists(CHALLENGE_STATE_PATH):
+        with open(CHALLENGE_STATE_PATH) as f:
+            eq = float(json.load(f)["challenge_start_equity"])
+        print(f"[RISK] Challenge start equity loaded  = {eq:.2f}  "
+              f"(delete {CHALLENGE_STATE_PATH} to reset)")
+    else:
+        eq = mt5.account_info().equity
+        with open(CHALLENGE_STATE_PATH, "w") as f:
+            json.dump({"challenge_start_equity": eq}, f, indent=2)
+        print(f"[RISK] Challenge start equity recorded = {eq:.2f}  -> {CHALLENGE_STATE_PATH}")
+    return eq
 
-    def _refresh_if_new_day(self):
+
+def compute_lot_size(equity: float, sl_dist_price: float) -> float:
+    """
+    Risk RISK_PCT_PER_TRADE% of equity on this trade.
+
+    sl_dist_price  stop-loss distance in price units (e.g. 0.0012 for 12 pips).
+    Returns lot size rounded to LOT_STEP and clamped to [MIN_LOTS, MAX_LOTS].
+    """
+    sl_pips  = max(sl_dist_price / PIP, 1.0)   # floor at 1 pip to avoid division blow-up
+    risk_usd = equity * (RISK_PCT_PER_TRADE / 100.0)
+    lots     = risk_usd / (sl_pips * PIP_VALUE_PER_LOT)
+    lots     = round(lots / LOT_STEP) * LOT_STEP
+    lots     = max(MIN_LOTS, min(MAX_LOTS, lots))
+    return round(lots, 2)
+
+
+class RiskGuard:
+    """
+    Enforces two independent drawdown limits:
+
+    daily   — equity vs start-of-UTC-day equity; resets at midnight.
+              Halts when drawdown >= MAX_DAILY_LOSS_PCT - DAILY_HALT_BUFFER_PCT.
+
+    total   — equity vs challenge-start equity (persisted to disk).
+              Halts PERMANENTLY when drawdown >= MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT.
+              Requires manual restart (and optionally deleting the state file).
+
+    Both checks use account EQUITY (balance + floating P&L) so an open losing
+    position counts immediately, matching how prop firms measure drawdown.
+    """
+
+    def __init__(self, mt5, challenge_start_eq: float):
+        self._mt5             = mt5
+        self._challenge_start = challenge_start_eq
+        self._day_start_eq    = mt5.account_info().equity
+        self._trade_date      = datetime.now(timezone.utc).date()
+        self._daily_halted    = False
+        self._total_halted    = False
+        daily_soft = MAX_DAILY_LOSS_PCT  - DAILY_HALT_BUFFER_PCT
+        total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
+        print(f"[RISK] Day-start equity      = {self._day_start_eq:.2f}")
+        print(f"[RISK] Challenge-start equity = {self._challenge_start:.2f}")
+        print(f"[RISK] Daily halt at         -{daily_soft:.1f}%  (hard limit -{MAX_DAILY_LOSS_PCT:.1f}%)")
+        print(f"[RISK] Total DD halt at      -{total_soft:.1f}%  (hard limit -{MAX_TOTAL_DRAWDOWN_PCT:.1f}%)")
+
+    def _reset_if_new_day(self) -> None:
         today = datetime.now(timezone.utc).date()
         if today != self._trade_date:
-            self._start_bal  = self._mt5.account_info().balance
-            self._trade_date = today
-            self._halted     = False
-            print(f"[RISK] New trading day — reset balance = {self._start_bal:.2f}")
+            self._day_start_eq = self._mt5.account_info().equity
+            self._trade_date   = today
+            self._daily_halted = False
+            print(f"[RISK] New UTC day — day_start_eq reset = {self._day_start_eq:.2f}")
 
-    def is_halted(self) -> bool:
-        self._refresh_if_new_day()
-        if self._halted:
+    def check(self, pos, close_fn) -> bool:
+        """
+        Returns True if trading must be blocked this iteration.
+        Closes pos (if open) the first time either limit is breached.
+        close_fn: callable(mt5, position) -> bool
+        """
+        # Total halt is permanent — check first so it is never skipped.
+        if self._total_halted:
             return True
-        bal  = self._mt5.account_info().balance
-        loss = (self._start_bal - bal) / self._start_bal * 100.0
-        if loss >= MAX_DAILY_LOSS_PCT:
-            print(f"[RISK] Daily loss {loss:.2f}% >= {MAX_DAILY_LOSS_PCT}% — HALTED for today")
-            self._halted = True
-        return self._halted
+
+        self._reset_if_new_day()
+
+        eq         = self._mt5.account_info().equity
+        total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
+        total_dd   = (self._challenge_start - eq) / self._challenge_start * 100.0
+
+        if total_dd >= total_soft:
+            print(f"[RISK] TOTAL DD {total_dd:.2f}% >= soft limit {total_soft:.1f}% "
+                  f"(hard = {MAX_TOTAL_DRAWDOWN_PCT:.1f}%) — PERMANENT HALT")
+            print(f"[RISK] Delete {CHALLENGE_STATE_PATH} and restart to reset.")
+            if pos is not None:
+                print("[RISK] Closing open position before halting.")
+                close_fn(self._mt5, pos)
+            self._total_halted = True
+            return True
+
+        if self._daily_halted:
+            return True
+
+        daily_soft = MAX_DAILY_LOSS_PCT - DAILY_HALT_BUFFER_PCT
+        daily_loss = (self._day_start_eq - eq) / self._day_start_eq * 100.0
+
+        if daily_loss >= daily_soft:
+            print(f"[RISK] DAILY LOSS {daily_loss:.2f}% >= soft limit {daily_soft:.1f}% "
+                  f"(hard = {MAX_DAILY_LOSS_PCT:.1f}%) — halted until next UTC day")
+            if pos is not None:
+                print("[RISK] Closing open position before halting.")
+                close_fn(self._mt5, pos)
+            self._daily_halted = True
+            return True
+
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -486,20 +600,21 @@ def run(
     mt5 = _mt5_import()
     connect_mt5(mt5)
 
-    risk_guard = DailyRiskGuard(mt5)
+    challenge_eq = _load_or_init_challenge_equity(mt5)
+    risk_guard   = RiskGuard(mt5, challenge_eq)
     _ensure_log(LOG_PATH)
 
     print(f"[LIVE] Starting  session_filter={session_filter}  dry_run={dry_run}")
-    print(f"[LIVE] Logging → {LOG_PATH}")
+    print(f"[LIVE] Logging -> {LOG_PATH}")
 
     while True:
         _wait_for_bar_close()
 
-        now_utc = datetime.now(timezone.utc)
-
-        # ---- Risk check ----
-        if risk_guard.is_halted():
-            print("[LOOP] Daily loss limit hit — waiting for next trading day")
+        # ---- Risk check (reads current position so the guard can close it) ----
+        # Do this BEFORE fetching new bars so a halt closes the position promptly.
+        pos = get_current_position(mt5) if not dry_run else None
+        if not dry_run and risk_guard.check(pos, close_position):
+            print("[LOOP] Risk halt active — waiting")
             continue
 
         # ---- Fetch closed bars ----
@@ -525,10 +640,11 @@ def run(
             print("[WARN] All feature rows NaN — skipping")
             continue
 
-        last_row   = feat_df.iloc[-1]
-        feat_dict  = {c: float(last_row[c]) for c in FEATURE_COLS}
+        last_row    = feat_df.iloc[-1]
+        feat_dict   = {c: float(last_row[c]) for c in FEATURE_COLS}
         close_price = float(last_row["Close"])
-        bar_ts      = last_row.name  # DatetimeIndex entry (UTC-aware)
+        atr_value   = float(last_row["H1_ATR"])   # raw ATR in price units for SL sizing
+        bar_ts      = last_row.name                # DatetimeIndex entry (UTC-aware)
         spread_pips = get_spread_pips(mt5)
 
         # ---- Predict ----
@@ -538,11 +654,11 @@ def run(
         print(
             f"[{bar_ts.strftime('%Y-%m-%d %H:%M')} UTC]  "
             f"signal={signal_label:<5}  p_long={p_long:.3f}  p_short={p_short:.3f}  "
-            f"spread={spread_pips:.1f}pip  close={close_price:.5f}"
+            f"spread={spread_pips:.1f}pip  close={close_price:.5f}  atr={atr_value/PIP:.1f}pip"
         )
 
         # ---- Session filter: only enter new positions in London/NY overlap ----
-        bar_hour = bar_ts.hour  # already UTC-aware from MT5 copy
+        bar_hour   = bar_ts.hour
         in_session = SESSION_START_UTC <= bar_hour < SESSION_END_UTC
 
         # ---- Log every signal regardless of session / position state ----
@@ -565,7 +681,7 @@ def run(
         #   (_apply_min_hold in xgb_walkforward.py locks a signal for min_hold bars;
         #    here we enforce the same floor by checking actual elapsed hours from the
         #    broker's position open timestamp — robust to reconnects and missed bars.)
-        pos = get_current_position(mt5)
+        pos = get_current_position(mt5)  # re-read: guard may have closed it above
 
         # Re-derive hold duration from broker state, not an in-memory counter.
         bars_held = bars_held_since_open(pos) if pos is not None else 0
@@ -585,8 +701,13 @@ def run(
                 time.sleep(1)  # brief pause before re-entering on same bar
 
         if pos is None and signal != 0 and can_enter:
-            print(f"[EXEC] Open {'BUY' if signal==1 else 'SELL'}")
-            open_position(mt5, signal)
+            sl_dist  = ATR_SL_MULT * atr_value
+            sl_price = close_price - sl_dist if signal == 1 else close_price + sl_dist
+            equity   = mt5.account_info().equity
+            lot_size = compute_lot_size(equity, sl_dist)
+            print(f"[RISK] Sizing: equity={equity:.2f}  sl_dist={sl_dist/PIP:.1f}pip  "
+                  f"risk={RISK_PCT_PER_TRADE}%  -> lots={lot_size}")
+            open_position(mt5, signal, sl_price=sl_price, lot_size=lot_size)
 
 
 # ---------------------------------------------------------------------------
