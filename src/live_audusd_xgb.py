@@ -29,7 +29,7 @@ import os
 import pickle
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -63,6 +63,22 @@ MAX_LOTS           = 1.0        # self-imposed cap per trade
 LOT_STEP           = 0.01       # broker lot increment
 
 CHALLENGE_STATE_PATH = os.path.join("live_logs", "challenge_state.json")
+
+# ── DAILY RESET TIME ──────────────────────────────────────────────────────────
+# Hour (UTC) at which the prop firm's "new trading day" begins.
+# FundingPips (and most MT4/MT5 prop firms) align to the New York close:
+#   5 pm ET = 22:00 UTC in winter (EST) / 21:00 UTC in summer (EDT)
+# Set to 0 for a straight UTC-midnight reset.
+# IMPORTANT: Verify your exact account type at dashboard.fundingpips.com
+# Current setting: 22:00 UTC (EST / winter).  Change to 21 when clocks spring forward.
+DAILY_RESET_HOUR_UTC = 22
+
+# ── TRAILING vs STATIC DRAWDOWN ───────────────────────────────────────────────
+# True  = FundingPips standard: drawdown floor follows your equity HIGH-WATER MARK
+#         upward as you profit, so the allowed loss is always measured from peak.
+# False = simpler static: floor is pinned at challenge_start_equity forever.
+# FundingPips standard challenges use TRAILING.  Verify for your specific plan.
+TRAILING_DRAWDOWN = True
 
 LONG_THRESHOLD  = 0.65
 SHORT_THRESHOLD = 0.65
@@ -297,8 +313,21 @@ def _mt5_import():
         )
 
 
-def connect_mt5(mt5) -> None:
-    if not mt5.initialize():
+def connect_mt5(mt5, login: int | None = None,
+                server: str | None = None,
+                password: str | None = None) -> None:
+    """
+    Connect to the running MT5 terminal.
+    If login/server/password are supplied (e.g. --login 123 --server MetaQuotes-Demo),
+    MT5 logs into that account instead of whatever is already open in the terminal.
+    Use this to point the bot at a MetaQuotes demo without touching the FundingPips login.
+    """
+    kwargs = {}
+    if login    is not None: kwargs["login"]    = login
+    if server   is not None: kwargs["server"]   = server
+    if password is not None: kwargs["password"] = password
+
+    if not mt5.initialize(**kwargs):
         raise RuntimeError(f"MT5 initialize() failed: {mt5.last_error()}")
     info = mt5.account_info()
     print(f"[MT5] Connected  account={info.login}  balance={info.balance:.2f}  "
@@ -516,40 +545,67 @@ def compute_lot_size(equity: float, sl_dist_price: float) -> float:
 
 class RiskGuard:
     """
-    Enforces two independent drawdown limits:
+    Enforces two independent drawdown limits using EQUITY (balance + floating P&L).
 
-    daily   — equity vs start-of-UTC-day equity; resets at midnight.
-              Halts when drawdown >= MAX_DAILY_LOSS_PCT - DAILY_HALT_BUFFER_PCT.
+    DAILY
+      Equity is compared to the day-start equity, where "day" resets at
+      DAILY_RESET_HOUR_UTC (default 22:00 UTC = 5pm ET / New York close).
+      Halts when loss >= MAX_DAILY_LOSS_PCT - DAILY_HALT_BUFFER_PCT.
+      Resets automatically at the next period boundary.
 
-    total   — equity vs challenge-start equity (persisted to disk).
-              Halts PERMANENTLY when drawdown >= MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT.
-              Requires manual restart (and optionally deleting the state file).
-
-    Both checks use account EQUITY (balance + floating P&L) so an open losing
-    position counts immediately, matching how prop firms measure drawdown.
+    TOTAL (permanent until manual restart)
+      If TRAILING_DRAWDOWN = True (FundingPips standard):
+        The reference tracks your peak equity (high-water mark).
+        Drawdown = (peak_equity - current_equity) / challenge_start * 100
+        The floor rises as you profit, matching FundingPips' trailing rule.
+      If TRAILING_DRAWDOWN = False:
+        Drawdown is static from challenge_start_equity.
+      Halts when >= MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT.
     """
+
+    @staticmethod
+    def _trading_period(now: datetime) -> object:
+        """
+        Return an opaque period key for the current trading day.
+        Shifting back by DAILY_RESET_HOUR_UTC hours means the boundary
+        lands at DAILY_RESET_HOUR_UTC:00 UTC instead of midnight.
+        Example: DAILY_RESET_HOUR_UTC=22 → day flips at 22:00 UTC.
+        """
+        return (now - timedelta(hours=DAILY_RESET_HOUR_UTC)).date()
 
     def __init__(self, mt5, challenge_start_eq: float):
         self._mt5             = mt5
         self._challenge_start = challenge_start_eq
-        self._day_start_eq    = mt5.account_info().equity
-        self._trade_date      = datetime.now(timezone.utc).date()
+        now                   = datetime.now(timezone.utc)
+        eq                    = mt5.account_info().equity
+        self._day_start_eq    = eq
+        self._peak_equity     = eq          # high-water mark for trailing DD
+        self._period          = self._trading_period(now)
         self._daily_halted    = False
         self._total_halted    = False
-        daily_soft = MAX_DAILY_LOSS_PCT  - DAILY_HALT_BUFFER_PCT
-        total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
-        print(f"[RISK] Day-start equity      = {self._day_start_eq:.2f}")
-        print(f"[RISK] Challenge-start equity = {self._challenge_start:.2f}")
-        print(f"[RISK] Daily halt at         -{daily_soft:.1f}%  (hard limit -{MAX_DAILY_LOSS_PCT:.1f}%)")
-        print(f"[RISK] Total DD halt at      -{total_soft:.1f}%  (hard limit -{MAX_TOTAL_DRAWDOWN_PCT:.1f}%)")
 
-    def _reset_if_new_day(self) -> None:
-        today = datetime.now(timezone.utc).date()
-        if today != self._trade_date:
+        daily_soft = MAX_DAILY_LOSS_PCT    - DAILY_HALT_BUFFER_PCT
+        total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
+        dd_type    = "TRAILING (HWM)" if TRAILING_DRAWDOWN else "STATIC"
+        reset_desc = f"{DAILY_RESET_HOUR_UTC:02d}:00 UTC"
+
+        print(f"[RISK] Day-start equity       = {self._day_start_eq:.2f}")
+        print(f"[RISK] Challenge-start equity  = {self._challenge_start:.2f}")
+        print(f"[RISK] Daily reset at          {reset_desc}  (DAILY_RESET_HOUR_UTC={DAILY_RESET_HOUR_UTC})")
+        print(f"[RISK] Daily halt at          -{daily_soft:.1f}%  (hard limit -{MAX_DAILY_LOSS_PCT:.1f}%)")
+        print(f"[RISK] Total DD type           {dd_type}")
+        print(f"[RISK] Total DD halt at       -{total_soft:.1f}%  (hard limit -{MAX_TOTAL_DRAWDOWN_PCT:.1f}%)")
+
+    def _reset_if_new_period(self) -> None:
+        now    = datetime.now(timezone.utc)
+        period = self._trading_period(now)
+        if period != self._period:
             self._day_start_eq = self._mt5.account_info().equity
-            self._trade_date   = today
+            self._period       = period
             self._daily_halted = False
-            print(f"[RISK] New UTC day — day_start_eq reset = {self._day_start_eq:.2f}")
+            reset_label = f"{DAILY_RESET_HOUR_UTC:02d}:00 UTC"
+            print(f"[RISK] New trading period ({reset_label}) "
+                  f"— day_start_eq = {self._day_start_eq:.2f}")
 
     def check(self, pos, close_fn) -> bool:
         """
@@ -557,19 +613,30 @@ class RiskGuard:
         Closes pos (if open) the first time either limit is breached.
         close_fn: callable(mt5, position) -> bool
         """
-        # Total halt is permanent — check first so it is never skipped.
+        # Permanent total halt — always checked first.
         if self._total_halted:
             return True
 
-        self._reset_if_new_day()
+        self._reset_if_new_period()
 
-        eq         = self._mt5.account_info().equity
+        eq = self._mt5.account_info().equity
+
+        # Update high-water mark BEFORE computing trailing DD.
+        self._peak_equity = max(self._peak_equity, eq)
+
+        # ── Total drawdown ────────────────────────────────────────────────────
         total_soft = MAX_TOTAL_DRAWDOWN_PCT - TOTAL_DD_BUFFER_PCT
-        total_dd   = (self._challenge_start - eq) / self._challenge_start * 100.0
+        if TRAILING_DRAWDOWN:
+            # Drawdown from peak; % expressed relative to challenge start balance.
+            total_dd  = (self._peak_equity - eq) / self._challenge_start * 100.0
+            dd_ref    = f"HWM={self._peak_equity:.2f}"
+        else:
+            total_dd  = (self._challenge_start - eq) / self._challenge_start * 100.0
+            dd_ref    = f"start={self._challenge_start:.2f}"
 
         if total_dd >= total_soft:
             print(f"[RISK] TOTAL DD {total_dd:.2f}% >= soft limit {total_soft:.1f}% "
-                  f"(hard = {MAX_TOTAL_DRAWDOWN_PCT:.1f}%) — PERMANENT HALT")
+                  f"({dd_ref}, hard = {MAX_TOTAL_DRAWDOWN_PCT:.1f}%) — PERMANENT HALT")
             print(f"[RISK] Delete {CHALLENGE_STATE_PATH} and restart to reset.")
             if pos is not None:
                 print("[RISK] Closing open position before halting.")
@@ -577,6 +644,7 @@ class RiskGuard:
             self._total_halted = True
             return True
 
+        # ── Daily loss ────────────────────────────────────────────────────────
         if self._daily_halted:
             return True
 
@@ -584,8 +652,9 @@ class RiskGuard:
         daily_loss = (self._day_start_eq - eq) / self._day_start_eq * 100.0
 
         if daily_loss >= daily_soft:
+            reset_label = f"{DAILY_RESET_HOUR_UTC:02d}:00 UTC"
             print(f"[RISK] DAILY LOSS {daily_loss:.2f}% >= soft limit {daily_soft:.1f}% "
-                  f"(hard = {MAX_DAILY_LOSS_PCT:.1f}%) — halted until next UTC day")
+                  f"(hard = {MAX_DAILY_LOSS_PCT:.1f}%) — halted until {reset_label}")
             if pos is not None:
                 print("[RISK] Closing open position before halting.")
                 close_fn(self._mt5, pos)
@@ -625,14 +694,19 @@ def run(
     clf,
     session_filter: bool = False,
     dry_run: bool = False,
+    login: int | None = None,
+    server: str | None = None,
+    password: str | None = None,
 ) -> None:
     """
     Main loop.
 
     dry_run=True: compute features and log signals but never touch MT5 orders.
+    login/server/password: override the default MT5 account (useful for pointing
+        at a MetaQuotes demo instead of the FundingPips prop account).
     """
     mt5 = _mt5_import()
-    connect_mt5(mt5)
+    connect_mt5(mt5, login=login, server=server, password=password)
 
     # Print broker constraints; capture minimum SL distance for clamping.
     min_sl_dist = print_broker_constraints(mt5)
@@ -762,13 +836,19 @@ def main() -> None:
     # Windows terminals that default to cp1252.
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(description="AUDUSD XGBoost Live Trader (MT5 Demo)")
+    parser = argparse.ArgumentParser(description="AUDUSD XGBoost Live Trader (MT5)")
     parser.add_argument("--no_retrain",     action="store_true",
                         help="Load existing model instead of retraining")
     parser.add_argument("--session_filter", action="store_true",
                         help=f"Only enter new positions {SESSION_START_UTC}:00-{SESSION_END_UTC}:00 UTC")
     parser.add_argument("--dry_run",        action="store_true",
                         help="Compute features and log signals only — no orders sent")
+    parser.add_argument("--login",    type=int,  default=None,
+                        help="MT5 account login (overrides the open terminal's account)")
+    parser.add_argument("--server",   type=str,  default=None,
+                        help="MT5 server name, e.g. MetaQuotes-Demo")
+    parser.add_argument("--password", type=str,  default=None,
+                        help="MT5 account password")
     args = parser.parse_args()
 
     os.makedirs("models",    exist_ok=True)
@@ -780,7 +860,14 @@ def main() -> None:
         clf = train_model(SUPER_CSV)
         save_model(clf, MODEL_PATH)
 
-    run(clf, session_filter=args.session_filter, dry_run=args.dry_run)
+    run(
+        clf,
+        session_filter=args.session_filter,
+        dry_run=args.dry_run,
+        login=args.login,
+        server=args.server,
+        password=args.password,
+    )
 
 
 if __name__ == "__main__":
