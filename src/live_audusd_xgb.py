@@ -508,24 +508,49 @@ def open_position(mt5, direction: int, sl_price: float, lot_size: float) -> bool
 # Risk management
 # ---------------------------------------------------------------------------
 
-def _load_or_init_challenge_equity(mt5) -> float:
+def _load_or_init_challenge_equity(mt5, reset_challenge: bool = False) -> float:
     """
     Load challenge-start equity from disk so it survives restarts.
-    On first run the current equity is written as the baseline.
-    Delete CHALLENGE_STATE_PATH to reset the circuit breaker.
+
+    The saved file stores both the equity baseline and the account login.
+    If the connected account login differs from the saved one, the file is
+    treated as stale and a fresh baseline is written for the new account.
+    --reset_challenge forces re-initialization regardless.
     """
+    info    = mt5.account_info()
+    login   = info.login
+    eq_live = info.equity
+
     os.makedirs(os.path.dirname(CHALLENGE_STATE_PATH), exist_ok=True)
-    if os.path.exists(CHALLENGE_STATE_PATH):
-        with open(CHALLENGE_STATE_PATH) as f:
-            eq = float(json.load(f)["challenge_start_equity"])
-        print(f"[RISK] Challenge start equity loaded  = {eq:.2f}  "
-              f"(delete {CHALLENGE_STATE_PATH} to reset)")
+
+    reason = None   # will be set to explain why we're re-initializing
+
+    if reset_challenge:
+        reason = "--reset_challenge flag"
+    elif not os.path.exists(CHALLENGE_STATE_PATH):
+        reason = "no saved state found"
     else:
-        eq = mt5.account_info().equity
-        with open(CHALLENGE_STATE_PATH, "w") as f:
-            json.dump({"challenge_start_equity": eq}, f, indent=2)
-        print(f"[RISK] Challenge start equity recorded = {eq:.2f}  -> {CHALLENGE_STATE_PATH}")
-    return eq
+        with open(CHALLENGE_STATE_PATH) as f:
+            state = json.load(f)
+        saved_login = state.get("account_login")
+        saved_eq    = float(state["challenge_start_equity"])
+
+        if saved_login != login:
+            reason = (f"account changed (saved={saved_login}, connected={login})")
+        else:
+            print(f"[RISK] Challenge baseline LOADED from file  "
+                  f"account={login}  start_equity={saved_eq:.2f}  "
+                  f"(--reset_challenge to override)")
+            return saved_eq
+
+    # Fresh initialization — write new state.
+    state = {"account_login": login, "challenge_start_equity": eq_live}
+    with open(CHALLENGE_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+    print(f"[RISK] Challenge baseline INITIALIZED  "
+          f"account={login}  start_equity={eq_live:.2f}  reason={reason}  "
+          f"-> {CHALLENGE_STATE_PATH}")
+    return eq_live
 
 
 def compute_lot_size(equity: float, sl_dist_price: float) -> float:
@@ -687,6 +712,7 @@ def run(
     login: int | None = None,
     server: str | None = None,
     password: str | None = None,
+    reset_challenge: bool = False,
 ) -> None:
     """
     Main loop.
@@ -694,6 +720,7 @@ def run(
     dry_run=True: compute features and log signals but never touch MT5 orders.
     login/server/password: override the default MT5 account (useful for pointing
         at a MetaQuotes demo instead of the FundingPips prop account).
+    reset_challenge: force a fresh challenge baseline from current equity.
     """
     mt5 = _mt5_import()
     connect_mt5(mt5, login=login, server=server, password=password)
@@ -701,7 +728,7 @@ def run(
     # Print broker constraints; capture minimum SL distance for clamping.
     min_sl_dist = print_broker_constraints(mt5)
 
-    challenge_eq = _load_or_init_challenge_equity(mt5)
+    challenge_eq = _load_or_init_challenge_equity(mt5, reset_challenge=reset_challenge)
     risk_guard   = RiskGuard(mt5, challenge_eq)
     _ensure_log(LOG_PATH)
 
@@ -839,6 +866,9 @@ def main() -> None:
                         help="MT5 server name, e.g. MetaQuotes-Demo")
     parser.add_argument("--password", type=str,  default=None,
                         help="MT5 account password")
+    parser.add_argument("--reset_challenge", action="store_true",
+                        help="Force re-initialize challenge baseline from current equity, "
+                             "overwriting the saved state file")
     args = parser.parse_args()
 
     os.makedirs("models",    exist_ok=True)
@@ -857,6 +887,7 @@ def main() -> None:
         login=args.login,
         server=args.server,
         password=args.password,
+        reset_challenge=args.reset_challenge,
     )
 
 
