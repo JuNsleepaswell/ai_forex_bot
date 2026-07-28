@@ -61,6 +61,7 @@ PIP_VALUE_PER_LOT  = 10.0       # USD per pip per standard lot (AUDUSD, USD acco
 MIN_LOTS           = 0.01       # broker minimum
 MAX_LOTS           = 1.0        # self-imposed cap per trade
 LOT_STEP           = 0.01       # broker lot increment
+MIN_SIZING_PIPS    = 8          # never compute lot size against a stop tighter than this
 
 CHALLENGE_STATE_PATH = os.path.join("live_logs", "challenge_state.json")
 
@@ -560,7 +561,10 @@ def compute_lot_size(equity: float, sl_dist_price: float) -> float:
     sl_dist_price  stop-loss distance in price units (e.g. 0.0012 for 12 pips).
     Returns lot size rounded to LOT_STEP and clamped to [MIN_LOTS, MAX_LOTS].
     """
-    sl_pips  = max(sl_dist_price / PIP, 1.0)   # floor at 1 pip to avoid division blow-up
+    # Floor stop distance at MIN_SIZING_PIPS so a momentarily tiny ATR can't
+    # inflate lot size (e.g. 3-pip ATR would otherwise produce ~1.67 lots).
+    # The actual SL price placed on the order still uses the raw ATR distance.
+    sl_pips  = max(sl_dist_price / PIP, float(MIN_SIZING_PIPS))
     risk_usd = equity * (RISK_PCT_PER_TRADE / 100.0)
     lots     = risk_usd / (sl_pips * PIP_VALUE_PER_LOT)
     lots     = round(lots / LOT_STEP) * LOT_STEP
